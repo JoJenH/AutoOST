@@ -6,4 +6,5 @@
 # 本地缓存与下载产物
 /applist.json
 /applist.json.tmp
+/config.json
 *.lua

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"archive/zip"
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path"
+	"path/filepath"
+	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +28,7 @@ const (
 	githubRaw   = "https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/%s/%s.lua"
 	appListURL  = "https://raw.githubusercontent.com/Austrum-lab/steam-appdb/master/data/all.json"
 	appListFile = "applist.json"
+	configFile  = "config.json"
 	storeSearch = "https://store.steampowered.com/api/storesearch/"
 	userAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -30,6 +38,9 @@ var httpClient = &http.Client{Timeout: 120 * time.Second}
 
 // searchClient 用于搜索回退的短超时客户端，避免国内超时卡很久。
 var searchClient = &http.Client{Timeout: 5 * time.Second}
+
+// steamDir 是用户配置的 Steam 运行目录，下载的 .lua 文件写入这里。
+var steamDir string
 
 // ---------------------------------------------------------------- 入口
 
@@ -49,9 +60,23 @@ func main() {
 		return
 	}
 
+	// 确保已配置 Steam 运行目录（首次启动交互式指定）。
+	dir, err := ensureSteamDir()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		os.Exit(1)
+	}
+	steamDir = dir
+
+	// 确保 OpenSteamTool 已安装（无 .AutoOST.flag 时下载最新发布并解压）。
+	if err := ensureTool(steamDir); err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		os.Exit(1)
+	}
+
 	// 单条命令下载指定 id 的 lua：走 CLI，下载完直接退出。
 	if len(os.Args) == 2 && isNumeric(os.Args[1]) {
-		res, err := download(os.Args[1])
+		res, err := download(os.Args[1], "")
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "错误:", err)
 			os.Exit(1)
@@ -75,6 +100,343 @@ func main() {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		os.Exit(1)
 	}
+}
+
+// ---------------------------------------------------------------- 配置
+
+type config struct {
+	SteamDir string `json:"steam_dir"`
+}
+
+func loadConfig() (config, error) {
+	var cfg config
+	data, err := os.ReadFile(configFile)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, err
+	}
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return cfg, fmt.Errorf("解析 %s 失败: %w", configFile, err)
+	}
+	return cfg, nil
+}
+
+func saveConfig(cfg config) error {
+	data, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(configFile, data, 0o644)
+}
+
+// ensureSteamDir 返回 Steam 运行目录；首次启动（或目录失效）时交互式指定并保存。
+func ensureSteamDir() (string, error) {
+	cfg, err := loadConfig()
+	if err != nil {
+		return "", err
+	}
+	if cfg.SteamDir != "" && isDir(cfg.SteamDir) {
+		return cfg.SteamDir, nil
+	}
+
+	for {
+		fmt.Print("请输入 Steam 运行目录: ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() {
+			return "", fmt.Errorf("读取输入失败")
+		}
+		dir := expandPath(strings.TrimSpace(scanner.Text()))
+		if dir == "" {
+			fmt.Println("路径不能为空，请重新输入")
+			continue
+		}
+		if !isDir(dir) {
+			fmt.Printf("目录不存在或不是文件夹: %s\n", dir)
+			continue
+		}
+		abs, err := filepath.Abs(dir)
+		if err != nil {
+			abs = dir
+		}
+		cfg.SteamDir = abs
+		if err := saveConfig(cfg); err != nil {
+			return "", err
+		}
+		return abs, nil
+	}
+}
+
+// expandPath 展开 ~ 和环境变量（如 $HOME）。
+func expandPath(p string) string {
+	if p == "~" {
+		if home, err := os.UserHomeDir(); err == nil {
+			return home
+		}
+		return p
+	}
+	if strings.HasPrefix(p, "~/") || strings.HasPrefix(p, `~\`) {
+		if home, err := os.UserHomeDir(); err == nil {
+			return filepath.Join(home, p[2:])
+		}
+	}
+	return os.ExpandEnv(p)
+}
+
+func isDir(p string) bool {
+	st, err := os.Stat(p)
+	return err == nil && st.IsDir()
+}
+
+// ---------------------------------------------------------------- OpenSteamTool 安装
+
+const (
+	ostReleasesURL = "https://github.com/OpenSteam001/OpenSteamTool/releases"
+	ostFlagName    = ".AutoOST.flag"
+)
+
+type ghAsset struct {
+	Name               string
+	BrowserDownloadURL string
+}
+
+// ensureTool 检查 Steam 根目录是否有 .AutoOST.flag，没有则下载最新发布 zip 并解压。
+func ensureTool(dir string) error {
+	flag := filepath.Join(dir, ostFlagName)
+	if _, err := os.Stat(flag); err == nil {
+		return nil
+	}
+
+	// 解压会覆盖 DLL；Steam 运行时（Windows）会锁住这些文件，需先退出。
+	if err := ensureSteamClosed(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(os.Stderr, "未找到 %s，正在获取 OpenSteamTool 最新发布...\n", ostFlagName)
+	asset, err := latestReleaseAsset()
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "下载 %s ...\n", asset.Name)
+
+	tmp, err := os.CreateTemp("", "opensteamtool-*.zip")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	tmp.Close()
+	defer os.Remove(tmpPath)
+
+	if err := downloadFile(asset.BrowserDownloadURL, tmpPath); err != nil {
+		return err
+	}
+	fmt.Fprintf(os.Stderr, "解压到 %s ...\n", dir)
+	if err := extractZip(tmpPath, dir); err != nil {
+		return err
+	}
+	if err := os.WriteFile(flag, []byte("ok"), 0o644); err != nil {
+		return err
+	}
+	return nil
+}
+
+// isSteamRunning 检测 Steam 进程是否在运行。仅在 Windows 上检查，
+// 因为 Windows 会锁住已加载的 DLL 导致无法覆盖。
+func isSteamRunning() bool {
+	if runtime.GOOS != "windows" {
+		return false
+	}
+	out, err := exec.Command("tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH").Output()
+	if err != nil {
+		return false
+	}
+	return strings.Contains(strings.ToLower(string(out)), "steam.exe")
+}
+
+// ensureSteamClosed 若 Steam 在运行则提示用户退出，并等待其关闭。
+func ensureSteamClosed() error {
+	if !isSteamRunning() {
+		return nil
+	}
+	fmt.Fprintln(os.Stderr, "检测到 Steam 正在运行：OpenSteamTool 解压会覆盖 Steam 已占用的 DLL，请先退出 Steam。")
+	for {
+		fmt.Print("退出 Steam 后按回车重试（Ctrl-C 取消）: ")
+		scanner := bufio.NewScanner(os.Stdin)
+		if !scanner.Scan() {
+			return fmt.Errorf("读取输入失败")
+		}
+		if !isSteamRunning() {
+			return nil
+		}
+		fmt.Println("Steam 仍在运行。")
+	}
+}
+
+// latestReleaseAsset 不依赖 GitHub API：通过 /releases/latest 跳转拿 tag，
+// 再从 /releases/expanded_assets/<tag> 解析 zip 下载链接（避免 API 限流）。
+func latestReleaseAsset() (ghAsset, error) {
+	tag, err := latestTag()
+	if err != nil {
+		return ghAsset{}, err
+	}
+	assets, err := releaseAssets(tag)
+	if err != nil {
+		return ghAsset{}, err
+	}
+	return pickZipAsset(assets)
+}
+
+func latestTag() (string, error) {
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // 不跟随跳转，只取 Location
+		},
+	}
+	req, err := http.NewRequest("GET", ostReleasesURL+"/latest", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	loc := resp.Header.Get("Location")
+	if loc == "" {
+		return "", fmt.Errorf("无法获取 latest 跳转地址 (HTTP %d)", resp.StatusCode)
+	}
+	tag := path.Base(loc)
+	if tag == "" || tag == "." || tag == "/" {
+		return "", fmt.Errorf("无法从跳转地址解析 tag: %s", loc)
+	}
+	return tag, nil
+}
+
+func releaseAssets(tag string) ([]ghAsset, error) {
+	u := fmt.Sprintf("%s/expanded_assets/%s", ostReleasesURL, tag)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("获取发布资产列表失败 (HTTP %d)", resp.StatusCode)
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	re := regexp.MustCompile(`releases/download/[^/"]+/([^/"]+\.zip)`)
+	var assets []ghAsset
+	for _, m := range re.FindAllStringSubmatch(string(body), -1) {
+		filename := m[1]
+		assets = append(assets, ghAsset{
+			Name:               filename,
+			BrowserDownloadURL: fmt.Sprintf("%s/download/%s/%s", ostReleasesURL, tag, filename),
+		})
+	}
+	if len(assets) == 0 {
+		return nil, fmt.Errorf("发布页里未找到 .zip 资产")
+	}
+	return assets, nil
+}
+
+func pickZipAsset(assets []ghAsset) (ghAsset, error) {
+	var zips []ghAsset
+	for _, a := range assets {
+		if strings.HasSuffix(strings.ToLower(a.Name), ".zip") {
+			zips = append(zips, a)
+		}
+	}
+	if len(zips) == 0 {
+		return ghAsset{}, fmt.Errorf("最新发布里没有 .zip 资产")
+	}
+	// 优先非 debug 版本
+	for _, a := range zips {
+		if !strings.Contains(strings.ToLower(a.Name), "debug") {
+			return a, nil
+		}
+	}
+	return zips[0], nil
+}
+
+func downloadFile(url, dst string) error {
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("下载失败 (HTTP %d)", resp.StatusCode)
+	}
+
+	f, err := os.Create(dst)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = io.Copy(f, resp.Body)
+	return err
+}
+
+func extractZip(zipPath, dest string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+
+	for _, f := range r.File {
+		name := filepath.Clean(f.Name)
+		if name == "." || strings.HasPrefix(name, "..") || filepath.IsAbs(name) {
+			continue // 防 zip-slip
+		}
+		target := filepath.Join(dest, name)
+
+		if f.FileInfo().IsDir() {
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		rc, err := f.Open()
+		if err != nil {
+			return err
+		}
+		out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, f.Mode())
+		if err != nil {
+			rc.Close()
+			return err
+		}
+		_, err = io.Copy(out, rc)
+		rc.Close()
+		out.Close()
+		if err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ---------------------------------------------------------------- 本地游戏列表
@@ -303,8 +665,8 @@ func (r downloadResult) String() string {
 }
 
 // download 优先从 GitHub ManifestHub 下载，拿不到再回退 Walftech。
-func download(appid string) (downloadResult, error) {
-	if out, size, ok := downloadGitHub(appid); ok {
+func download(appid, name string) (downloadResult, error) {
+	if out, size, ok := downloadGitHub(appid, name); ok {
 		return downloadResult{Source: "GitHub", File: out, Size: size}, nil
 	}
 
@@ -320,7 +682,7 @@ func download(appid string) (downloadResult, error) {
 	if err != nil {
 		return downloadResult{}, err
 	}
-	out, size, err := downloadLua(appid, token)
+	out, size, err := downloadLua(appid, token, name)
 	if err != nil {
 		return downloadResult{}, err
 	}
@@ -334,7 +696,7 @@ func download(appid string) (downloadResult, error) {
 	}, nil
 }
 
-func downloadGitHub(appid string) (string, int64, bool) {
+func downloadGitHub(appid, name string) (string, int64, bool) {
 	u := fmt.Sprintf(githubRaw, appid, appid)
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
@@ -351,12 +713,16 @@ func downloadGitHub(appid string) (string, int64, bool) {
 		return "", 0, false
 	}
 
-	out := appid + ".lua"
-	size, err := saveFile(out, resp.Body)
+	basename := luaFilename(appid, name)
+	dir, err := luaOutputDir()
 	if err != nil {
 		return "", 0, false
 	}
-	return out, size, true
+	size, err := saveFile(filepath.Join(dir, basename), resp.Body)
+	if err != nil {
+		return "", 0, false
+	}
+	return basename, size, true
 }
 
 func saveFile(path string, r io.Reader) (int64, error) {
@@ -366,6 +732,86 @@ func saveFile(path string, r io.Reader) (int64, error) {
 	}
 	defer f.Close()
 	return io.Copy(f, r)
+}
+
+// luaOutputDir 返回 .lua 存放目录（Steam 根目录/config/lua），并确保其存在。
+func luaOutputDir() (string, error) {
+	dir := filepath.Join(steamDir, "config", "lua")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	return dir, nil
+}
+
+// listLuaFiles 返回 Steam/config/lua 下的 .lua 文件名列表（按名称排序）。
+func listLuaFiles() ([]string, error) {
+	dir, err := luaOutputDir()
+	if err != nil {
+		return nil, err
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var files []string
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(strings.ToLower(e.Name()), ".lua") {
+			files = append(files, e.Name())
+		}
+	}
+	sort.Strings(files)
+	return files, nil
+}
+
+// deleteLuaFile 删除 Steam/config/lua 下的指定 .lua 文件。
+func deleteLuaFile(name string) error {
+	if name == "" || filepath.Base(name) != name {
+		return fmt.Errorf("非法文件名: %s", name)
+	}
+	dir, err := luaOutputDir()
+	if err != nil {
+		return err
+	}
+	return os.Remove(filepath.Join(dir, name))
+}
+
+// readLuaFile 读取 Steam/config/lua 下的 .lua 文件内容，按行返回。
+func readLuaFile(name string) ([]string, error) {
+	if name == "" || filepath.Base(name) != name {
+		return nil, fmt.Errorf("非法文件名: %s", name)
+	}
+	dir, err := luaOutputDir()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(filepath.Join(dir, name))
+	if err != nil {
+		return nil, err
+	}
+	return strings.Split(string(data), "\n"), nil
+}
+
+// luaFilename 生成下载文件名：有名字时为 "名字-appid.lua"，否则 "appid.lua"。
+func luaFilename(appid, name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return appid + ".lua"
+	}
+	return sanitizeFilename(name) + "-" + appid + ".lua"
+}
+
+// sanitizeFilename 去掉 Windows 非法字符并截断到合理长度。
+func sanitizeFilename(name string) string {
+	re := regexp.MustCompile(`[<>:"/\\|?*\x00-\x1f]`)
+	s := re.ReplaceAllString(name, "_")
+	s = strings.TrimRight(s, ". ")
+	if s == "" {
+		s = "_"
+	}
+	if r := []rune(s); len(r) > 60 {
+		s = string(r[:60])
+	}
+	return s
 }
 
 // ---------------------------------------------------------------- Walftech 门禁
@@ -455,7 +901,7 @@ func redeem(appid, challenge string, nonce int64) (string, error) {
 	return d.Token, nil
 }
 
-func downloadLua(appid, token string) (string, int64, error) {
+func downloadLua(appid, token, name string) (string, int64, error) {
 	q := url.Values{}
 	q.Set("id", appid)
 	q.Set("token", token)
@@ -475,12 +921,16 @@ func downloadLua(appid, token string) (string, int64, error) {
 		return "", 0, fmt.Errorf("下载失败 (HTTP %d): %s", resp.StatusCode, string(data))
 	}
 
-	out := appid + ".lua"
-	size, err := saveFile(out, resp.Body)
+	basename := luaFilename(appid, name)
+	dir, err := luaOutputDir()
 	if err != nil {
 		return "", 0, err
 	}
-	return out, size, nil
+	size, err := saveFile(filepath.Join(dir, basename), resp.Body)
+	if err != nil {
+		return "", 0, err
+	}
+	return basename, size, nil
 }
 
 func walftechRequest(method, path string, body io.Reader, params url.Values) (*http.Request, error) {

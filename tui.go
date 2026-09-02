@@ -35,6 +35,7 @@ var (
 
 	actionStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(subColor)).Italic(true)
 	actionSelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(bgColor)).Background(lipgloss.Color("#06B6D4")).Bold(true)
+	warnStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(bgColor)).Background(lipgloss.Color(errColor)).Bold(true)
 )
 
 // ---------------------------------------------------------------- 消息
@@ -53,6 +54,14 @@ type downloadDoneMsg struct {
 
 // ---------------------------------------------------------------- 模型
 
+type viewMode int
+
+const (
+	modeSearch viewMode = iota
+	modeLua
+	modeLuaContent
+)
+
 type appModel struct {
 	input       textinput.Model
 	spinner     spinner.Model
@@ -65,6 +74,14 @@ type appModel struct {
 	searching   bool
 	status      string
 	statusOK    bool
+
+	mode           viewMode
+	luas           []string
+	luaCursor      int
+	confirmDelete  string
+	luaViewingName string
+	luaContent     []string
+	contentScroll  int
 }
 
 func runApp(initial string, apps []appEntry) error {
@@ -125,7 +142,22 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+		switch m.mode {
+		case modeLua:
+			return m.updateLuaMode(msg)
+		case modeLuaContent:
+			return m.updateLuaContentView(msg)
+		}
+
 		switch msg.String() {
+		case "ctrl+l":
+			m.mode = modeLua
+			m.luas, _ = listLuaFiles()
+			m.luaCursor = 0
+			m.confirmDelete = ""
+			m.status = ""
+			return m, nil
+
 		case "esc":
 			if m.input.Value() != "" {
 				m.input.SetValue("")
@@ -240,6 +272,107 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateLuaMode 处理「已安装 Lua」模式的按键。
+func (m *appModel) updateLuaMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc":
+		m.mode = modeSearch
+		m.confirmDelete = ""
+		m.status = ""
+		return m, nil
+
+	case "up", "k":
+		m.confirmDelete = ""
+		if m.luaCursor > 0 {
+			m.luaCursor--
+		}
+		return m, nil
+
+	case "down", "j":
+		m.confirmDelete = ""
+		if m.luaCursor < len(m.luas)-1 {
+			m.luaCursor++
+		}
+		return m, nil
+
+	case "enter":
+		if len(m.luas) == 0 {
+			return m, nil
+		}
+		name := m.luas[m.luaCursor]
+		lines, err := readLuaFile(name)
+		if err != nil {
+			m.status = fmt.Sprintf("读取失败: %v", err)
+			m.statusOK = false
+			return m, nil
+		}
+		m.luaViewingName = name
+		m.luaContent = lines
+		m.contentScroll = 0
+		m.confirmDelete = ""
+		m.mode = modeLuaContent
+		return m, nil
+
+	case "d", "delete":
+		if len(m.luas) == 0 {
+			return m, nil
+		}
+		name := m.luas[m.luaCursor]
+		if m.confirmDelete != name {
+			m.confirmDelete = name
+			m.status = fmt.Sprintf("再按一次 d 确认删除 %s（Esc 取消）", name)
+			m.statusOK = true
+			return m, nil
+		}
+		m.confirmDelete = ""
+		if err := deleteLuaFile(name); err != nil {
+			m.status = fmt.Sprintf("删除失败: %v", err)
+			m.statusOK = false
+		} else {
+			m.status = fmt.Sprintf("已删除 %s", name)
+			m.statusOK = true
+		}
+		m.luas, _ = listLuaFiles()
+		if m.luaCursor >= len(m.luas) && m.luaCursor > 0 {
+			m.luaCursor = len(m.luas) - 1
+		}
+		return m, nil
+	}
+	return m, nil
+}
+
+// updateLuaContentView 处理「查看 Lua 内容」模式的按键。
+func (m *appModel) updateLuaContentView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	h := m.listHeight()
+	switch msg.String() {
+	case "esc", "q", "enter":
+		m.mode = modeLua
+		return m, nil
+	case "up", "k":
+		if m.contentScroll > 0 {
+			m.contentScroll--
+		}
+	case "down", "j":
+		if m.contentScroll < len(m.luaContent)-h {
+			m.contentScroll++
+		}
+	case "pgup":
+		m.contentScroll -= h
+		if m.contentScroll < 0 {
+			m.contentScroll = 0
+		}
+	case "pgdn":
+		m.contentScroll += h
+		if m.contentScroll > len(m.luaContent)-h {
+			m.contentScroll = len(m.luaContent) - h
+		}
+		if m.contentScroll < 0 {
+			m.contentScroll = 0
+		}
+	}
+	return m, nil
+}
+
 func (m *appModel) View() string {
 	w := m.width
 	if w == 0 {
@@ -253,11 +386,18 @@ func (m *appModel) View() string {
 		boxW = 100
 	}
 
+	switch m.mode {
+	case modeLua:
+		return m.viewLua(boxW)
+	case modeLuaContent:
+		return m.viewLuaContent(boxW)
+	}
+
 	title := titleStyle.Render("Lua4OST · Steam 游戏 Lua 下载器")
 	list := m.renderList()
 	action := m.renderAction()
 	status := m.statusLine()
-	help := helpStyle.Render("Ctrl-C 退出 · ↑/↓ 选择 · 回车 下载 · Tab 搜索商店 · Esc 清空/退出")
+	help := helpStyle.Render("Ctrl-C 退出 · ↑/↓ 选择 · 回车 下载 · Tab 商店 · Ctrl+L 已装Lua · Esc 清空")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		title,
@@ -273,6 +413,123 @@ func (m *appModel) View() string {
 	)
 	box := boxStyle.Width(boxW).Render(content)
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// viewLua 渲染「已安装 Lua 文件」视图（与搜索视图保持同高度）。
+func (m *appModel) viewLua(boxW int) string {
+	title := titleStyle.Render("Lua4OST · 已安装的 Lua 文件")
+	header := helpStyle.Render(fmt.Sprintf("共 %d 个 (Steam/config/lua/)", len(m.luas)))
+	list := m.renderLuaList()
+	hint := helpStyle.Render("回车 查看 · d/Delete 删除")
+	status := m.statusLine()
+	help := helpStyle.Render("↑/↓ 选择 · 回车 查看 · d 删除 · Esc 返回 · Ctrl-C 退出")
+
+	content := lipgloss.JoinVertical(lipgloss.Left,
+		title,
+		"",
+		header,
+		"",
+		list,
+		"",
+		hint,
+		"",
+		status,
+		help,
+	)
+	box := boxStyle.Width(boxW).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m *appModel) renderLuaList() string {
+	h := m.listHeight()
+	lines := make([]string, h)
+
+	if len(m.luas) == 0 {
+		lines[0] = helpStyle.Render("暂无已安装的 Lua 文件")
+		return strings.Join(lines, "\n")
+	}
+
+	start, end := 0, len(m.luas)
+	if len(m.luas) > h {
+		if m.luaCursor >= start+h {
+			start = m.luaCursor - h + 1
+		}
+		end = start + h
+		if end > len(m.luas) {
+			end = len(m.luas)
+			start = end - h
+		}
+	}
+
+	maxW := 2
+	for i := start; i < end; i++ {
+		if w := lipgloss.Width(m.luas[i]); w > maxW {
+			maxW = w
+		}
+	}
+	lineW := maxW + 2
+
+	li := 0
+	for i := start; i < end; i++ {
+		name := m.luas[i]
+		switch {
+		case i == m.luaCursor && m.confirmDelete == name:
+			lines[li] = warnStyle.Width(lineW).Render("▶ " + name)
+		case i == m.luaCursor:
+			lines[li] = selStyle.Width(lineW).Render("▶ " + name)
+		default:
+			lines[li] = normStyle.Width(lineW).Render("  " + name)
+		}
+		li++
+	}
+	return strings.Join(lines, "\n")
+}
+
+// viewLuaContent 渲染「查看 Lua 内容」视图。
+func (m *appModel) viewLuaContent(boxW int) string {
+	title := titleStyle.Render(fmt.Sprintf("Lua4OST · %s", m.luaViewingName))
+
+	content := m.renderLuaContent() // 内部会 clamp contentScroll
+
+	total := len(m.luaContent)
+	h := m.listHeight()
+	start := m.contentScroll + 1
+	end := m.contentScroll + h
+	if end > total {
+		end = total
+	}
+	if start > total {
+		start = total
+	}
+	header := helpStyle.Render(fmt.Sprintf("第 %d-%d 行 / 共 %d 行", start, end, total))
+
+	hint := helpStyle.Render("PgUp/PgDn 翻页")
+	status := m.statusLine()
+	help := helpStyle.Render("↑/↓ 滚动 · Esc/q 返回 · Ctrl-C 退出")
+
+	box := boxStyle.Width(boxW).Render(lipgloss.JoinVertical(lipgloss.Left,
+		title, "", header, "", content, "", hint, "", status, help,
+	))
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+func (m *appModel) renderLuaContent() string {
+	h := m.listHeight()
+	total := len(m.luaContent)
+	if m.contentScroll > total-h {
+		m.contentScroll = total - h
+	}
+	if m.contentScroll < 0 {
+		m.contentScroll = 0
+	}
+	lines := make([]string, h)
+	for i := 0; i < h; i++ {
+		idx := m.contentScroll + i
+		if idx < total {
+			lines[i] = strings.ReplaceAll(m.luaContent[idx], "\t", "    ")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // listHeight 根据终端高度给出固定行数（不随结果条数变化）。
@@ -385,14 +642,14 @@ func doRemoteSearch(query string) tea.Cmd {
 func doDownloadItem(item appEntry) tea.Cmd {
 	appid := strconv.Itoa(item.ID)
 	return func() tea.Msg {
-		res, err := download(appid)
+		res, err := download(appid, item.Name)
 		return downloadDoneMsg{label: item.Name, res: res, err: err}
 	}
 }
 
 func doDownloadID(appid string) tea.Cmd {
 	return func() tea.Msg {
-		res, err := download(appid)
+		res, err := download(appid, "")
 		return downloadDoneMsg{label: "id=" + appid, res: res, err: err}
 	}
 }
