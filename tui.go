@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -13,7 +12,6 @@ import (
 )
 
 const (
-	pageSize     = 12
 	maxNameWidth = 60
 	accentColor  = "#8B5CF6"
 	bgColor      = "#1F2937"
@@ -34,15 +32,16 @@ var (
 	errStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(errColor))
 	selStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color(bgColor)).Background(accent).Bold(true)
 	normStyle  = lipgloss.NewStyle().Foreground(lipgloss.Color(subColor))
+
+	actionStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(subColor)).Italic(true)
+	actionSelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(bgColor)).Background(lipgloss.Color("#06B6D4")).Bold(true)
 )
 
 // ---------------------------------------------------------------- 消息
 
-type searchTriggerMsg struct{ query string }
-
 type searchDoneMsg struct {
 	query string
-	items []searchItem
+	items []appEntry
 	err   error
 }
 
@@ -57,19 +56,20 @@ type downloadDoneMsg struct {
 type appModel struct {
 	input       textinput.Model
 	spinner     spinner.Model
-	results     []searchItem
+	apps        []appEntry
+	results     []appEntry
 	cursor      int
 	width       int
 	height      int
-	searching   bool
 	downloading bool
+	searching   bool
 	status      string
 	statusOK    bool
 }
 
-func runApp(initial string) error {
+func runApp(initial string, apps []appEntry) error {
 	ti := textinput.New()
-	ti.Placeholder = "game name or appid, e.g. 730"
+	ti.Placeholder = "game name, e.g. hozy"
 	ti.Prompt = "❯ "
 	ti.CharLimit = 128
 	ti.Width = 56
@@ -86,7 +86,12 @@ func runApp(initial string) error {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(accent)
 
-	m := &appModel{input: ti, spinner: s, statusOK: true}
+	m := &appModel{input: ti, spinner: s, apps: apps, statusOK: true}
+	m.results = searchLocal(initial, apps)
+	if initial != "" && len(m.results) == 0 {
+		m.searching = true
+	}
+
 	p := tea.NewProgram(m, tea.WithAltScreen())
 	_, err := p.Run()
 	return err
@@ -94,9 +99,8 @@ func runApp(initial string) error {
 
 func (m *appModel) Init() tea.Cmd {
 	cmds := []tea.Cmd{textinput.Blink, m.spinner.Tick}
-	if m.input.Value() != "" {
-		m.searching = true
-		cmds = append(cmds, doSearch(m.input.Value()))
+	if m.searching {
+		cmds = append(cmds, doRemoteSearch(m.input.Value()))
 	}
 	return tea.Batch(cmds...)
 }
@@ -127,7 +131,6 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.input.SetValue("")
 				m.results = nil
 				m.cursor = 0
-				m.searching = false
 				m.status = ""
 				return m, nil
 			}
@@ -140,14 +143,31 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "down", "j":
-			if m.cursor < len(m.results)-1 {
+			if m.cursor < len(m.results) {
 				m.cursor++
+			}
+			return m, nil
+
+		case "tab":
+			// 在结果首项与"搜索 Steam 商店"之间跳转
+			if len(m.results) > 0 {
+				if m.cursor == len(m.results) {
+					m.cursor = 0
+				} else {
+					m.cursor = len(m.results)
+				}
 			}
 			return m, nil
 
 		case "enter":
 			if m.downloading {
 				return m, nil
+			}
+			// 光标停在"没有想要的结果？"上 → 手动搜索 Steam 商店。
+			if m.cursor >= len(m.results) && m.input.Value() != "" {
+				m.searching = true
+				m.status = ""
+				return m, doRemoteSearch(m.input.Value())
 			}
 			// 输入框里直接输了数字 appid → 直接下。
 			if isNumeric(m.input.Value()) {
@@ -169,26 +189,20 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input, cmd = m.input.Update(msg)
 		if m.input.Value() != old {
 			m.cursor = 0
-			m.results = nil
-			return m, tea.Batch(cmd, debounceSearch(m.input.Value()))
+			m.results = searchLocal(m.input.Value(), m.apps)
+			m.searching = false
+			m.status = ""
+			if m.input.Value() != "" && len(m.results) == 0 {
+				m.searching = true
+				return m, tea.Batch(cmd, doRemoteSearch(m.input.Value()))
+			}
+			return m, cmd
 		}
 		return m, cmd
 
-	case searchTriggerMsg:
-		if msg.query != m.input.Value() {
-			return m, nil // 过期
-		}
-		if msg.query == "" {
-			m.searching = false
-			m.results = nil
-			return m, nil
-		}
-		m.searching = true
-		return m, doSearch(msg.query)
-
 	case searchDoneMsg:
 		if msg.query != m.input.Value() {
-			return m, nil
+			return m, nil // 过期
 		}
 		m.searching = false
 		if msg.err != nil {
@@ -227,23 +241,23 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *appModel) View() string {
-	title := titleStyle.Render("Lua4OST · Steam 游戏 Lua 下载器")
-
-	list := m.renderList()
-
-	var statusLine string
-	switch {
-	case m.downloading:
-		statusLine = fmt.Sprintf("%s %s", m.spinner.View(), m.status)
-	case m.status != "":
-		if m.statusOK {
-			statusLine = okStyle.Render(m.status)
-		} else {
-			statusLine = errStyle.Render(m.status)
-		}
+	w := m.width
+	if w == 0 {
+		w = 80
+	}
+	boxW := w - 4
+	if boxW < 40 {
+		boxW = 40
+	}
+	if boxW > 100 {
+		boxW = 100
 	}
 
-	help := helpStyle.Render("Ctrl-C 退出 · ↑/↓ 选择 · 回车 下载 · Esc 清空/退出")
+	title := titleStyle.Render("Lua4OST · Steam 游戏 Lua 下载器")
+	list := m.renderList()
+	action := m.renderAction()
+	status := m.statusLine()
+	help := helpStyle.Render("Ctrl-C 退出 · ↑/↓ 选择 · 回车 下载 · Tab 搜索商店 · Esc 清空/退出")
 
 	content := lipgloss.JoinVertical(lipgloss.Left,
 		title,
@@ -251,40 +265,62 @@ func (m *appModel) View() string {
 		m.input.View(),
 		"",
 		list,
-		statusLine,
 		"",
+		action,
+		"",
+		status,
 		help,
 	)
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, boxStyle.Render(content))
+	box := boxStyle.Width(boxW).Render(content)
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
+}
+
+// listHeight 根据终端高度给出固定行数（不随结果条数变化）。
+func (m *appModel) listHeight() int {
+	h := m.height
+	if h == 0 {
+		h = 24
+	}
+	h -= 13
+	if h < 4 {
+		h = 4
+	}
+	return h
 }
 
 func (m *appModel) renderList() string {
+	h := m.listHeight()
+	lines := make([]string, h)
+
 	if m.searching {
-		return fmt.Sprintf("%s 搜索中...", m.spinner.View())
+		lines[0] = fmt.Sprintf("%s 搜索中...", m.spinner.View())
+		return strings.Join(lines, "\n")
 	}
 	if len(m.results) == 0 {
 		if m.input.Value() == "" {
-			return helpStyle.Render("输入游戏名开始搜索（支持中英文）")
+			lines[0] = helpStyle.Render("输入游戏名开始搜索（本地离线搜索）")
+		} else {
+			lines[0] = helpStyle.Render("本地无结果")
 		}
-		return helpStyle.Render("无结果，试试换个关键词")
+		return strings.Join(lines, "\n")
 	}
 
 	start, end := 0, len(m.results)
-	if len(m.results) > pageSize {
-		if m.cursor >= start+pageSize {
-			start = m.cursor - pageSize + 1
+	if len(m.results) > h {
+		if m.cursor >= start+h {
+			start = m.cursor - h + 1
 		}
-		end = start + pageSize
+		end = start + h
 		if end > len(m.results) {
 			end = len(m.results)
-			start = end - pageSize
+			start = end - h
 		}
 	}
 
 	names := make([]string, 0, end-start)
 	maxW := 2
 	for i := start; i < end; i++ {
-		line := fmt.Sprintf("%s (id=%d)", truncateName(m.results[i].Name, maxNameWidth), m.results[i].ID)
+		line := m.resultLine(i)
 		names = append(names, line)
 		if w := lipgloss.Width(line); w > maxW {
 			maxW = w
@@ -292,34 +328,61 @@ func (m *appModel) renderList() string {
 	}
 	lineW := maxW + 2
 
-	var b strings.Builder
+	li := 0
 	for i := start; i < end; i++ {
 		if i == m.cursor {
-			b.WriteString(selStyle.Width(lineW).Render("▶ " + names[i-start]))
+			lines[li] = selStyle.Width(lineW).Render("▶ " + names[i-start])
 		} else {
-			b.WriteString(normStyle.Width(lineW).Render("  " + names[i-start]))
+			lines[li] = normStyle.Width(lineW).Render("  " + names[i-start])
 		}
-		b.WriteString("\n")
+		li++
 	}
-	return b.String()
+	return strings.Join(lines, "\n")
+}
+
+func (m *appModel) renderAction() string {
+	if m.input.Value() == "" {
+		return ""
+	}
+	action := "没有想要的结果？→ 搜索 Steam 商店"
+	if m.cursor == len(m.results) {
+		return actionSelStyle.Render("▶ " + action)
+	}
+	return actionStyle.Render("  " + action)
+}
+
+func (m *appModel) statusLine() string {
+	switch {
+	case m.downloading:
+		return fmt.Sprintf("%s %s", m.spinner.View(), m.status)
+	case m.status != "":
+		if m.statusOK {
+			return okStyle.Render(m.status)
+		}
+		return errStyle.Render(m.status)
+	}
+	return ""
+}
+
+func (m *appModel) resultLine(i int) string {
+	e := m.results[i]
+	name := truncateName(e.Name, maxNameWidth)
+	if e.Type != "game" {
+		return fmt.Sprintf("%s (id=%d, %s)", name, e.ID, e.Type)
+	}
+	return fmt.Sprintf("%s (id=%d)", name, e.ID)
 }
 
 // ---------------------------------------------------------------- 命令
 
-func debounceSearch(query string) tea.Cmd {
-	return tea.Tick(250*time.Millisecond, func(time.Time) tea.Msg {
-		return searchTriggerMsg{query: query}
-	})
-}
-
-func doSearch(query string) tea.Cmd {
+func doRemoteSearch(query string) tea.Cmd {
 	return func() tea.Msg {
-		items, err := searchApp(query)
+		items, err := searchRemote(query)
 		return searchDoneMsg{query: query, items: items, err: err}
 	}
 }
 
-func doDownloadItem(item searchItem) tea.Cmd {
+func doDownloadItem(item appEntry) tea.Cmd {
 	appid := strconv.Itoa(item.ID)
 	return func() tea.Msg {
 		res, err := download(appid)

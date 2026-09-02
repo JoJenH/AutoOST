@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +19,8 @@ import (
 const (
 	baseURL     = "https://walftech.com"
 	githubRaw   = "https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/%s/%s.lua"
+	appListURL  = "https://raw.githubusercontent.com/Austrum-lab/steam-appdb/master/data/all.json"
+	appListFile = "applist.json"
 	storeSearch = "https://store.steampowered.com/api/storesearch/"
 	userAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -25,12 +28,25 @@ const (
 
 var httpClient = &http.Client{Timeout: 120 * time.Second}
 
+// searchClient 用于搜索回退的短超时客户端，避免国内超时卡很久。
+var searchClient = &http.Client{Timeout: 5 * time.Second}
+
 // ---------------------------------------------------------------- 入口
 
 func main() {
 	if len(os.Args) > 2 {
-		fmt.Fprintf(os.Stderr, "用法: %s [appid|游戏名]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "用法: %s [appid|游戏名|update]\n", os.Args[0])
 		os.Exit(1)
+	}
+
+	// 手动更新本地游戏列表
+	if len(os.Args) == 2 && os.Args[1] == "update" {
+		if err := updateAppList(); err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			os.Exit(1)
+		}
+		fmt.Println("已更新", appListFile)
+		return
 	}
 
 	// 单条命令下载指定 id 的 lua：走 CLI，下载完直接退出。
@@ -45,14 +61,226 @@ func main() {
 	}
 
 	// 其余情况（无参数 / 游戏名）都进 TUI 搜索并下载。
+	apps, err := loadAppList()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "错误:", err)
+		os.Exit(1)
+	}
+
 	initial := ""
 	if len(os.Args) == 2 {
 		initial = os.Args[1]
 	}
-	if err := runApp(initial); err != nil {
+	if err := runApp(initial, apps); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		os.Exit(1)
 	}
+}
+
+// ---------------------------------------------------------------- 本地游戏列表
+
+type appEntry struct {
+	ID   int    `json:"appid"`
+	Name string `json:"name"`
+	Type string `json:"type"`
+}
+
+// searchTypes 是纳入本地搜索的类型（其余如 config/tool/video 丢弃）。
+var searchTypes = map[string]bool{"game": true, "dlc": true, "music": true}
+
+// loadAppList 读取本地列表；文件不存在时才自动从 GitHub 拉取。
+func loadAppList() ([]appEntry, error) {
+	if _, err := os.Stat(appListFile); err != nil {
+		if !os.IsNotExist(err) {
+			return nil, err
+		}
+		fmt.Fprintf(os.Stderr, "未找到 %s，正在从 GitHub 拉取...\n", appListFile)
+		if err := fetchAppList(); err != nil {
+			return nil, err
+		}
+	}
+	return readAppList(appListFile)
+}
+
+// updateAppList 强制重新拉取（手动 update 命令用）。
+func updateAppList() error {
+	fmt.Fprintf(os.Stderr, "正在从 GitHub 更新 %s ...\n", appListFile)
+	return fetchAppList()
+}
+
+func fetchAppList() error {
+	req, err := http.NewRequest("GET", appListURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("列表下载失败 (HTTP %d)", resp.StatusCode)
+	}
+
+	tmp := appListFile + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp, appListFile)
+}
+
+// readAppList 流式解析 all.json 数组，只保留 searchTypes 里的类型。
+func readAppList(path string) ([]appEntry, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	dec := json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil { // 顶层 '['
+		return nil, fmt.Errorf("解析 %s 失败: %w", path, err)
+	}
+	var apps []appEntry
+	for dec.More() {
+		var e appEntry
+		if err := dec.Decode(&e); err != nil {
+			return nil, fmt.Errorf("解析 %s 失败: %w", path, err)
+		}
+		if searchTypes[e.Type] {
+			apps = append(apps, e)
+		}
+	}
+	return apps, nil
+}
+
+// searchLocal 本地模糊搜索：忽略大小写的子串匹配，精确 > 前缀 > 子串，game 类型优先。
+func searchLocal(query string, apps []appEntry) []appEntry {
+	q := strings.ToLower(strings.TrimSpace(query))
+	if q == "" {
+		return nil
+	}
+
+	type scored struct {
+		e appEntry
+		s int
+	}
+	var res []scored
+	for _, e := range apps {
+		idx := strings.Index(strings.ToLower(e.Name), q)
+		if idx < 0 {
+			continue
+		}
+		s := 2 // 子串
+		if strings.EqualFold(e.Name, q) {
+			s = 0 // 精确
+		} else if idx == 0 {
+			s = 1 // 前缀
+		}
+		if e.Type != "game" {
+			s += 3
+		}
+		res = append(res, scored{e, s})
+	}
+
+	sort.SliceStable(res, func(i, j int) bool {
+		if res[i].s != res[j].s {
+			return res[i].s < res[j].s
+		}
+		return res[i].e.ID < res[j].e.ID
+	})
+
+	out := make([]appEntry, 0, len(res))
+	for _, r := range res {
+		out = append(out, r.e)
+		if len(out) >= 50 {
+			break
+		}
+	}
+	return out
+}
+
+// searchRemote 是本地搜索 0 结果时的回退：调 Steam 商店搜索（短超时）。
+func searchRemote(name string) ([]appEntry, error) {
+	langs := [][2]string{{"english", "US"}, {"schinese", "CN"}}
+	if isCJK(name) {
+		langs[0], langs[1] = langs[1], langs[0]
+	}
+	var lastErr error
+	for _, l := range langs {
+		items, err := searchStore(name, l[0], l[1])
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if len(items) > 0 {
+			return items, nil
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, nil
+}
+
+func searchStore(name, lang, cc string) ([]appEntry, error) {
+	req, err := http.NewRequest("GET", storeSearch, nil)
+	if err != nil {
+		return nil, err
+	}
+	q := req.URL.Query()
+	q.Set("term", name)
+	q.Set("l", lang)
+	q.Set("cc", cc)
+	req.URL.RawQuery = q.Encode()
+	req.Header.Set("User-Agent", userAgent)
+
+	resp, err := searchClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("搜索失败 (HTTP %d)", resp.StatusCode)
+	}
+
+	var sr struct {
+		Items []struct {
+			ID   int    `json:"id"`
+			Name string `json:"name"`
+			Type string `json:"type"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
+		return nil, err
+	}
+
+	var apps []appEntry
+	for _, it := range sr.Items {
+		if it.Type == "app" {
+			apps = append(apps, appEntry{ID: it.ID, Name: it.Name, Type: "game"})
+		}
+	}
+	return apps, nil
+}
+
+func isCJK(s string) bool {
+	for _, r := range s {
+		if (r >= 0x3400 && r <= 0x4DBF) || (r >= 0x4E00 && r <= 0x9FFF) {
+			return true
+		}
+	}
+	return false
 }
 
 // ---------------------------------------------------------------- 下载编排
@@ -274,75 +502,6 @@ func walftechRequest(method, path string, body io.Reader, params url.Values) (*h
 	return req, nil
 }
 
-// ---------------------------------------------------------------- 游戏名搜索
-
-type searchItem struct {
-	ID   int    `json:"id"`
-	Name string `json:"name"`
-	Type string `json:"type"`
-}
-
-// searchApp 按 Steam 商店搜索，语言随查询自适应：中文走简中，否则英文，
-// 主语言无结果时回退另一种语言。
-func searchApp(name string) ([]searchItem, error) {
-	langs := [][2]string{{"english", "US"}, {"schinese", "CN"}}
-	if isCJK(name) {
-		langs[0], langs[1] = langs[1], langs[0]
-	}
-	var lastErr error
-	for _, l := range langs {
-		items, err := searchStore(name, l[0], l[1])
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if len(items) > 0 {
-			return items, nil
-		}
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, nil
-}
-
-func searchStore(name, lang, cc string) ([]searchItem, error) {
-	req, err := http.NewRequest("GET", storeSearch, nil)
-	if err != nil {
-		return nil, err
-	}
-	q := req.URL.Query()
-	q.Set("term", name)
-	q.Set("l", lang)
-	q.Set("cc", cc)
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("User-Agent", userAgent)
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("搜索失败 (HTTP %d)", resp.StatusCode)
-	}
-
-	var sr struct {
-		Items []searchItem `json:"items"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&sr); err != nil {
-		return nil, err
-	}
-
-	var apps []searchItem
-	for _, it := range sr.Items {
-		if it.Type == "app" {
-			apps = append(apps, it)
-		}
-	}
-	return apps, nil
-}
-
 // ---------------------------------------------------------------- 工具
 
 func truncate(b []byte) string {
@@ -362,13 +521,4 @@ func isNumeric(s string) bool {
 		}
 	}
 	return true
-}
-
-func isCJK(s string) bool {
-	for _, r := range s {
-		if (r >= 0x3400 && r <= 0x4DBF) || (r >= 0x4E00 && r <= 0x9FFF) {
-			return true
-		}
-	}
-	return false
 }
