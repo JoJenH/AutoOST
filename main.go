@@ -26,6 +26,7 @@ import (
 const (
 	baseURL     = "https://walftech.com"
 	githubRaw   = "https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/%s/%s.lua"
+	manifestRaw = "https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/%s/%s"
 	appListURL  = "https://raw.githubusercontent.com/Austrum-lab/steam-appdb/master/data/all.json"
 	appListFile = "applist.json"
 	configFile  = "config.json"
@@ -42,6 +43,23 @@ var searchClient = &http.Client{Timeout: 5 * time.Second}
 // steamDir 是用户配置的 Steam 运行目录，下载的 .lua 文件写入这里。
 var steamDir string
 
+// downloadManifests 表示是否把 depot manifest 一并下到 depotcache（由配置决定）。
+var downloadManifests = true
+
+// stdin 全局共享一个带缓冲的读取器。多次新建 bufio.Scanner(os.Stdin) 会各自
+// 预读缓冲，导致管道输入时后续提示读不到数据。
+var stdin = bufio.NewReader(os.Stdin)
+
+// readLine 读取一行（去掉行尾换行）；EOF 且无内容时返回 ok=false。
+func readLine() (string, bool) {
+	line, err := stdin.ReadString('\n')
+	line = strings.TrimRight(line, "\r\n")
+	if err != nil && line == "" {
+		return "", false
+	}
+	return line, true
+}
+
 // ---------------------------------------------------------------- 入口
 
 func main() {
@@ -50,15 +68,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 手动更新本地游戏列表
-	if len(os.Args) == 2 && os.Args[1] == "update" {
-		if err := updateAppList(); err != nil {
-			fmt.Fprintln(os.Stderr, "错误:", err)
-			os.Exit(1)
-		}
-		fmt.Println("已更新", appListFile)
-		return
-	}
+	isUpdate := len(os.Args) == 2 && os.Args[1] == "update"
 
 	// 确保已配置 Steam 运行目录（首次启动交互式指定）。
 	dir, err := ensureSteamDir()
@@ -68,10 +78,34 @@ func main() {
 	}
 	steamDir = dir
 
-	// 确保 OpenSteamTool 已安装（无 .AutoOST.flag 时下载最新发布并解压）。
-	if err := ensureTool(steamDir); err != nil {
+	// update 命令：刷新游戏列表 + 升级 OpenSteamTool。
+	if isUpdate {
+		if err := updateAppList(); err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			os.Exit(1)
+		}
+		fmt.Println("已更新", appListFile)
+		if err := updateToolCLI(steamDir); err != nil {
+			fmt.Fprintln(os.Stderr, "错误:", err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// 确保 OpenSteamTool 已安装（未装则装；有更新仅标记，不自动重装）。
+	autoCheck, wantManifest := true, true
+	if cfg, err := loadConfig(); err == nil {
+		autoCheck = cfg.autoCheckUpdate()
+		wantManifest = cfg.downloadManifest()
+	}
+	downloadManifests = wantManifest
+	updateAvailable, err := ensureTool(steamDir, autoCheck)
+	if err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		os.Exit(1)
+	}
+	if updateAvailable {
+		fmt.Fprintln(os.Stderr, "提示: OpenSteamTool 有新版本，可在 TUI 中更新（Tab 跳到该行后回车）")
 	}
 
 	// 单条命令下载指定 id 的 lua：走 CLI，下载完直接退出。
@@ -96,7 +130,7 @@ func main() {
 	if len(os.Args) == 2 {
 		initial = os.Args[1]
 	}
-	if err := runApp(initial, apps); err != nil {
+	if err := runApp(initial, apps, updateAvailable, autoCheck); err != nil {
 		fmt.Fprintln(os.Stderr, "错误:", err)
 		os.Exit(1)
 	}
@@ -105,7 +139,26 @@ func main() {
 // ---------------------------------------------------------------- 配置
 
 type config struct {
-	SteamDir string `json:"steam_dir"`
+	SteamDir         string `json:"steam_dir"`
+	AutoCheckUpdate  *bool  `json:"auto_check_update,omitempty"`
+	DownloadManifest *bool  `json:"download_manifest,omitempty"`
+}
+
+// autoCheckUpdate 表示是否自动检查 OpenSteamTool 更新；默认开启
+// （旧配置文件没有该字段时视为开启）。
+func (c config) autoCheckUpdate() bool {
+	if c.AutoCheckUpdate == nil {
+		return true
+	}
+	return *c.AutoCheckUpdate
+}
+
+// downloadManifest 表示是否把 depot manifest 一并下载到 depotcache；默认开启。
+func (c config) downloadManifest() bool {
+	if c.DownloadManifest == nil {
+		return true
+	}
+	return *c.DownloadManifest
 }
 
 func loadConfig() (config, error) {
@@ -143,11 +196,11 @@ func ensureSteamDir() (string, error) {
 
 	for {
 		fmt.Print("请输入 Steam 运行目录: ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if !scanner.Scan() {
+		line, ok := readLine()
+		if !ok {
 			return "", fmt.Errorf("读取输入失败")
 		}
-		dir := expandPath(strings.TrimSpace(scanner.Text()))
+		dir := expandPath(strings.TrimSpace(line))
 		if dir == "" {
 			fmt.Println("路径不能为空，请重新输入")
 			continue
@@ -161,11 +214,32 @@ func ensureSteamDir() (string, error) {
 			abs = dir
 		}
 		cfg.SteamDir = abs
+		// 首次设置时一并选择是否自动检查更新
+		auto := promptYesNo("是否自动检查 OpenSteamTool 更新? [Y/n]: ", true)
+		cfg.AutoCheckUpdate = &auto
+		dm := promptYesNo("是否下载 depot manifest 到 depotcache? [Y/n]: ", true)
+		cfg.DownloadManifest = &dm
 		if err := saveConfig(cfg); err != nil {
 			return "", err
 		}
 		return abs, nil
 	}
+}
+
+// promptYesNo 读取一行 y/n 回答；空输入或无法识别时用默认值。
+func promptYesNo(prompt string, def bool) bool {
+	fmt.Print(prompt)
+	line, ok := readLine()
+	if !ok {
+		return def
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes", "是":
+		return true
+	case "n", "no", "否":
+		return false
+	}
+	return def
 }
 
 // expandPath 展开 ~ 和环境变量（如 $HOME）。
@@ -202,41 +276,131 @@ type ghAsset struct {
 }
 
 // ensureTool 检查 Steam 根目录是否有 .AutoOST.flag，没有则下载最新发布 zip 并解压。
-func ensureTool(dir string) error {
-	flag := filepath.Join(dir, ostFlagName)
-	if _, err := os.Stat(flag); err == nil {
-		return nil
+// installedToolVersion 读取已安装的 OpenSteamTool 版本；未安装返回 ""。
+func installedToolVersion(dir string) string {
+	data, err := os.ReadFile(filepath.Join(dir, ostFlagName))
+	if err != nil {
+		return ""
 	}
+	return strings.TrimSpace(string(data))
+}
 
-	// 解压会覆盖 DLL；Steam 运行时（Windows）会锁住这些文件，需先退出。
+// ensureTool 确保 OpenSteamTool 已安装；autoCheck 为 true 时顺带检查最新版本，
+// 返回是否有可用更新（任何时候都不自动重装）。
+func ensureTool(dir string, autoCheck bool) (bool, error) {
+	installed := installedToolVersion(dir)
+	if installed == "" {
+		if err := installToolCLI(dir); err != nil {
+			return false, err
+		}
+		return false, nil
+	}
+	if !autoCheck {
+		return false, nil
+	}
+	latest, err := latestTag(5 * time.Second)
+	if err != nil {
+		return false, nil // 检查失败，当作无更新
+	}
+	return installed != latest, nil
+}
+
+// installToolCLI 交互式安装/升级 OpenSteamTool（检测 Steam 运行并等待退出）。
+func installToolCLI(dir string) error {
 	if err := ensureSteamClosed(); err != nil {
 		return err
 	}
-
-	fmt.Fprintf(os.Stderr, "未找到 %s，正在获取 OpenSteamTool 最新发布...\n", ostFlagName)
-	asset, err := latestReleaseAsset()
+	fmt.Fprintln(os.Stderr, "正在获取 OpenSteamTool 最新发布...")
+	version, err := doInstallTool(dir)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "下载 %s ...\n", asset.Name)
+	fmt.Fprintf(os.Stderr, "已安装 OpenSteamTool v%s\n", version)
+	return nil
+}
+
+// updateToolCLI 供 update 命令使用：升级到最新版（已是最新则跳过）。
+func updateToolCLI(dir string) error {
+	installed := installedToolVersion(dir)
+	latest, err := latestTag(15 * time.Second)
+	if err != nil {
+		return err
+	}
+	if installed == latest {
+		fmt.Printf("OpenSteamTool 已是最新 (v%s)\n", latest)
+		return nil
+	}
+	if installed == "" {
+		fmt.Printf("未安装 OpenSteamTool，开始安装 v%s\n", latest)
+	} else {
+		fmt.Printf("OpenSteamTool 有更新: v%s -> v%s，开始升级\n", installed, latest)
+	}
+	return installToolCLI(dir)
+}
+
+// doInstallTool 下载最新版并解压，flag 写入版本号。返回版本号（不打印、不检测 Steam）。
+func doInstallTool(dir string) (string, error) {
+	tag, err := latestTag(15 * time.Second)
+	if err != nil {
+		return "", err
+	}
+	assets, err := releaseAssets(tag)
+	if err != nil {
+		return "", err
+	}
+	asset, err := pickZipAsset(assets)
+	if err != nil {
+		return "", err
+	}
 
 	tmp, err := os.CreateTemp("", "opensteamtool-*.zip")
 	if err != nil {
-		return err
+		return "", err
 	}
 	tmpPath := tmp.Name()
 	tmp.Close()
 	defer os.Remove(tmpPath)
 
 	if err := downloadFile(asset.BrowserDownloadURL, tmpPath); err != nil {
-		return err
+		return "", err
 	}
-	fmt.Fprintf(os.Stderr, "解压到 %s ...\n", dir)
+	// 解压前预检目标文件是否可写：被占用（Steam/游戏仍在运行）就直接报错，
+	// 避免解压到一半失败、留下 DLL 半新半旧的烂摊子。
+	if err := checkWritable(tmpPath, dir); err != nil {
+		return "", err
+	}
 	if err := extractZip(tmpPath, dir); err != nil {
+		return "", err
+	}
+	if err := os.WriteFile(filepath.Join(dir, ostFlagName), []byte(tag), 0o644); err != nil {
+		return "", err
+	}
+	return tag, nil
+}
+
+// checkWritable 逐个尝试以写方式打开 zip 中「已存在」的目标文件。
+// Windows 上被进程加载的 DLL 不允许写入，会在这里就失败；Unix 无此锁，恒为可写。
+func checkWritable(zipPath, dest string) error {
+	r, err := zip.OpenReader(zipPath)
+	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(flag, []byte("ok"), 0o644); err != nil {
-		return err
+	defer r.Close()
+
+	for _, f := range r.File {
+		name := filepath.Clean(f.Name)
+		if name == "." || strings.HasPrefix(name, "..") || filepath.IsAbs(name) || f.FileInfo().IsDir() {
+			continue
+		}
+		target := filepath.Join(dest, name)
+		if _, err := os.Stat(target); err != nil {
+			continue // 目标不存在，无需预检
+		}
+		fh, err := os.OpenFile(target, os.O_WRONLY, 0)
+		if err != nil {
+			return fmt.Errorf("无法覆盖 %s（文件被占用，请先退出 Steam 及相关游戏）: %w", name, err)
+		}
+		fh.Close()
 	}
 	return nil
 }
@@ -262,8 +426,7 @@ func ensureSteamClosed() error {
 	fmt.Fprintln(os.Stderr, "检测到 Steam 正在运行：OpenSteamTool 解压会覆盖 Steam 已占用的 DLL，请先退出 Steam。")
 	for {
 		fmt.Print("退出 Steam 后按回车重试（Ctrl-C 取消）: ")
-		scanner := bufio.NewScanner(os.Stdin)
-		if !scanner.Scan() {
+		if _, ok := readLine(); !ok {
 			return fmt.Errorf("读取输入失败")
 		}
 		if !isSteamRunning() {
@@ -273,23 +436,9 @@ func ensureSteamClosed() error {
 	}
 }
 
-// latestReleaseAsset 不依赖 GitHub API：通过 /releases/latest 跳转拿 tag，
-// 再从 /releases/expanded_assets/<tag> 解析 zip 下载链接（避免 API 限流）。
-func latestReleaseAsset() (ghAsset, error) {
-	tag, err := latestTag()
-	if err != nil {
-		return ghAsset{}, err
-	}
-	assets, err := releaseAssets(tag)
-	if err != nil {
-		return ghAsset{}, err
-	}
-	return pickZipAsset(assets)
-}
-
-func latestTag() (string, error) {
+func latestTag(timeout time.Duration) (string, error) {
 	client := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: timeout,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // 不跟随跳转，只取 Location
 		},
@@ -654,20 +803,42 @@ type downloadResult struct {
 	Nonce      int64
 	PowMs      int64
 	Difficulty int
+	Manifests  int // 已写入 depotcache 的 manifest 个数
+	Skipped    int // 仓库里没有对应 manifest（多为共享 depot）而跳过的个数
 }
 
 func (r downloadResult) String() string {
 	if r.Source == "GitHub" {
-		return fmt.Sprintf("%s (%s, %d bytes)", r.File, r.Source, r.Size)
+		s := fmt.Sprintf("%s (%s, %d bytes)", r.File, r.Source, r.Size)
+		if r.Manifests > 0 || r.Skipped > 0 {
+			s += fmt.Sprintf(" + manifest %d", r.Manifests)
+			if r.Skipped > 0 {
+				s += fmt.Sprintf("(跳过 %d 个无 manifest 的共享 depot)", r.Skipped)
+			}
+		}
+		return s
 	}
-	return fmt.Sprintf("%s (%s, %d bytes | PoW %d 次 %dms | difficulty=%d)",
+	s := fmt.Sprintf("%s (%s, %d bytes | PoW %d 次 %dms | difficulty=%d)",
 		r.File, r.Source, r.Size, r.Nonce, r.PowMs, r.Difficulty)
+	if r.Manifests > 0 {
+		s += fmt.Sprintf(" + manifest %d", r.Manifests)
+	}
+	return s
 }
 
 // download 优先从 GitHub ManifestHub 下载，拿不到再回退 Walftech。
 func download(appid, name string) (downloadResult, error) {
 	if out, size, ok := downloadGitHub(appid, name); ok {
-		return downloadResult{Source: "GitHub", File: out, Size: size}, nil
+		res := downloadResult{Source: "GitHub", File: out, Size: size}
+		// lua 里用 setManifestid 固定了 depot 版本，顺带把这些 manifest 拉进 depotcache。
+		if downloadManifests {
+			if dir, err := luaOutputDir(); err == nil {
+				if lua, err := os.ReadFile(filepath.Join(dir, out)); err == nil {
+					res.Manifests, res.Skipped = syncManifests(appid, lua)
+				}
+			}
+		}
+		return res, nil
 	}
 
 	challenge, difficulty, err := getChallenge()
@@ -682,7 +853,7 @@ func download(appid, name string) (downloadResult, error) {
 	if err != nil {
 		return downloadResult{}, err
 	}
-	out, size, err := downloadLua(appid, token, name)
+	out, size, manifests, err := downloadLuaFull(appid, token, name)
 	if err != nil {
 		return downloadResult{}, err
 	}
@@ -690,6 +861,7 @@ func download(appid, name string) (downloadResult, error) {
 		Source:     "Walftech",
 		File:       out,
 		Size:       size,
+		Manifests:  manifests,
 		Nonce:      nonce,
 		PowMs:      powMs,
 		Difficulty: difficulty,
@@ -741,6 +913,58 @@ func luaOutputDir() (string, error) {
 		return "", err
 	}
 	return dir, nil
+}
+
+// ---------------------------------------------------------------- Manifest
+
+// reSetManifest 匹配 lua 里的 setManifestid(<depot>,"<gid>")。
+var reSetManifest = regexp.MustCompile(`setManifestid\(\s*(\d+)\s*,\s*"(\d+)"\s*\)`)
+
+type manifestRef struct {
+	Depot string
+	GID   string
+}
+
+func parseManifests(lua []byte) []manifestRef {
+	var refs []manifestRef
+	seen := make(map[string]bool)
+	for _, m := range reSetManifest.FindAllStringSubmatch(string(lua), -1) {
+		key := m[1] + "_" + m[2]
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		refs = append(refs, manifestRef{Depot: m[1], GID: m[2]})
+	}
+	return refs
+}
+
+// syncManifests 把 lua 里声明的 depot manifest 下载到 <Steam>/depotcache/。
+// 仓库里没有对应文件的（多为 228980 系列共享 depot）计入 skipped。
+func syncManifests(appid string, lua []byte) (ok, skipped int) {
+	refs := parseManifests(lua)
+	if len(refs) == 0 {
+		return 0, 0
+	}
+	dir := filepath.Join(steamDir, "depotcache")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return 0, len(refs)
+	}
+	for _, r := range refs {
+		name := r.Depot + "_" + r.GID + ".manifest"
+		dest := filepath.Join(dir, name)
+		if _, err := os.Stat(dest); err == nil {
+			ok++ // 已存在，跳过下载
+			continue
+		}
+		if err := downloadFile(fmt.Sprintf(manifestRaw, appid, name), dest); err != nil {
+			os.Remove(dest)
+			skipped++
+			continue
+		}
+		ok++
+	}
+	return ok, skipped
 }
 
 // listLuaFiles 返回 Steam/config/lua 下的 .lua 文件名列表（按名称排序）。
@@ -901,36 +1125,108 @@ func redeem(appid, challenge string, nonce int64) (string, error) {
 	return d.Token, nil
 }
 
-func downloadLua(appid, token, name string) (string, int64, error) {
+// downloadLuaFull 走 Walftech 保底分支，用 format=full 一次拿到 lua + manifests 的 zip：
+// lua 写入 <Steam>/config/lua/，manifest 写入 <Steam>/depotcache/。
+// 返回 lua 文件名、lua 大小、写入的 manifest 个数。
+func downloadLuaFull(appid, token, name string) (string, int64, int, error) {
 	q := url.Values{}
 	q.Set("id", appid)
 	q.Set("token", token)
-	q.Set("format", "lua")
+	if downloadManifests {
+		q.Set("format", "full") // zip：lua + 全部 manifest
+	} else {
+		q.Set("format", "lua") // 只要 lua，体积小得多
+	}
 
 	req, err := walftechRequest("GET", "/depotbox_lua.php", nil, q)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
-		return "", 0, fmt.Errorf("下载失败 (HTTP %d): %s", resp.StatusCode, string(data))
+		return "", 0, 0, fmt.Errorf("下载失败 (HTTP %d): %s", resp.StatusCode, string(data))
 	}
 
-	basename := luaFilename(appid, name)
-	dir, err := luaOutputDir()
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
-	size, err := saveFile(filepath.Join(dir, basename), resp.Body)
+
+	luaDir, err := luaOutputDir()
 	if err != nil {
-		return "", 0, err
+		return "", 0, 0, err
 	}
-	return basename, size, nil
+	luaName := luaFilename(appid, name)
+	luaPath := filepath.Join(luaDir, luaName)
+
+	// 个别 appid 可能只返回纯 lua 而不是 zip，直接落盘即可。
+	if len(body) < 2 || string(body[:2]) != "PK" {
+		if err := os.WriteFile(luaPath, body, 0o644); err != nil {
+			return "", 0, 0, err
+		}
+		return luaName, int64(len(body)), 0, nil
+	}
+
+	depotDir := filepath.Join(steamDir, "depotcache")
+	if err := os.MkdirAll(depotDir, 0o755); err != nil {
+		return "", 0, 0, err
+	}
+
+	zr, err := zip.NewReader(bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		return "", 0, 0, err
+	}
+
+	var luaSize int64
+	manifests := 0
+	for _, zf := range zr.File {
+		base := filepath.Base(zf.Name)
+		switch {
+		case strings.HasSuffix(strings.ToLower(base), ".lua"):
+			n, err := extractZipEntry(zf, luaPath)
+			if err != nil {
+				return "", 0, 0, err
+			}
+			luaSize = n
+		case strings.HasSuffix(strings.ToLower(base), ".manifest"):
+			dest := filepath.Join(depotDir, base)
+			if _, err := os.Stat(dest); err == nil {
+				manifests++
+				continue // 已存在，不重复写
+			}
+			if _, err := extractZipEntry(zf, dest); err != nil {
+				continue
+			}
+			manifests++
+		}
+	}
+	if luaSize == 0 {
+		return "", 0, 0, fmt.Errorf("zip 里没有 .lua 文件")
+	}
+	return luaName, luaSize, manifests, nil
+}
+
+// extractZipEntry 把 zip 中的单个条目写到 dest。
+func extractZipEntry(zf *zip.File, dest string) (int64, error) {
+	rc, err := zf.Open()
+	if err != nil {
+		return 0, err
+	}
+	defer rc.Close()
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return 0, err
+	}
+	out, err := os.Create(dest)
+	if err != nil {
+		return 0, err
+	}
+	defer out.Close()
+	return io.Copy(out, rc)
 }
 
 func walftechRequest(method, path string, body io.Reader, params url.Values) (*http.Request, error) {

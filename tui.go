@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/textinput"
@@ -36,6 +37,7 @@ var (
 	actionStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color(subColor)).Italic(true)
 	actionSelStyle = lipgloss.NewStyle().Foreground(lipgloss.Color(bgColor)).Background(lipgloss.Color("#06B6D4")).Bold(true)
 	warnStyle      = lipgloss.NewStyle().Foreground(lipgloss.Color(bgColor)).Background(lipgloss.Color(errColor)).Bold(true)
+	noticeStyle    = lipgloss.NewStyle().Foreground(lipgloss.Color("#FBBF24")).Bold(true)
 )
 
 // ---------------------------------------------------------------- 消息
@@ -50,6 +52,12 @@ type downloadDoneMsg struct {
 	label string
 	res   downloadResult
 	err   error
+}
+
+type upgradeDoneMsg struct {
+	version  string
+	uptodate bool
+	err      error
 }
 
 // ---------------------------------------------------------------- 模型
@@ -82,9 +90,13 @@ type appModel struct {
 	luaViewingName string
 	luaContent     []string
 	contentScroll  int
+
+	toolUpdateAvail bool
+	toolAutoCheck   bool
+	upgrading       bool
 }
 
-func runApp(initial string, apps []appEntry) error {
+func runApp(initial string, apps []appEntry, toolUpdateAvail, toolAutoCheck bool) error {
 	ti := textinput.New()
 	ti.Placeholder = "game name, e.g. hozy"
 	ti.Prompt = "❯ "
@@ -103,7 +115,8 @@ func runApp(initial string, apps []appEntry) error {
 	s.Spinner = spinner.Dot
 	s.Style = lipgloss.NewStyle().Foreground(accent)
 
-	m := &appModel{input: ti, spinner: s, apps: apps, statusOK: true}
+	m := &appModel{input: ti, spinner: s, apps: apps, statusOK: true,
+		toolUpdateAvail: toolUpdateAvail, toolAutoCheck: toolAutoCheck}
 	m.results = searchLocal(initial, apps)
 	if initial != "" && len(m.results) == 0 {
 		m.searching = true
@@ -175,25 +188,45 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 
 		case "down", "j":
-			if m.cursor < len(m.results) {
+			if m.cursor < m.maxCursor() {
 				m.cursor++
 			}
 			return m, nil
 
 		case "tab":
-			// 在结果首项与"搜索 Steam 商店"之间跳转
-			if len(m.results) > 0 {
-				if m.cursor == len(m.results) {
-					m.cursor = 0
-				} else {
-					m.cursor = len(m.results)
+			// 循环跳到下一个动作行（搜索商店 / OpenSteamTool）
+			var actions []int
+			if m.input.Value() != "" {
+				actions = append(actions, len(m.results))
+			}
+			if m.toolRowVisible() {
+				actions = append(actions, len(m.results)+1)
+			}
+			next := -1
+			for _, r := range actions {
+				if r > m.cursor {
+					next = r
+					break
 				}
+			}
+			if next < 0 && len(actions) > 0 {
+				next = actions[0]
+			}
+			if next >= 0 {
+				m.cursor = next
 			}
 			return m, nil
 
 		case "enter":
-			if m.downloading {
+			if m.downloading || m.upgrading {
 				return m, nil
+			}
+			// 光标停在 OpenSteamTool 那行 → 检查/更新
+			if m.toolRowVisible() && m.cursor == len(m.results)+1 {
+				m.upgrading = true
+				m.status = "正在检查 OpenSteamTool 更新 ..."
+				m.statusOK = true
+				return m, doUpdateTool()
 			}
 			// 光标停在"没有想要的结果？"上 → 手动搜索 Steam 商店。
 			if m.cursor >= len(m.results) && m.input.Value() != "" {
@@ -264,12 +297,46 @@ func (m *appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case upgradeDoneMsg:
+		m.upgrading = false
+		switch {
+		case msg.err != nil:
+			m.status = fmt.Sprintf("OpenSteamTool 更新失败: %v", msg.err)
+			m.statusOK = false
+		case msg.uptodate:
+			m.status = fmt.Sprintf("OpenSteamTool 已是最新 (v%s)", msg.version)
+			m.statusOK = true
+			m.toolUpdateAvail = false
+		default:
+			m.status = fmt.Sprintf("✓ OpenSteamTool 已更新到 v%s", msg.version)
+			m.statusOK = true
+			m.toolUpdateAvail = false
+		}
+		if m.cursor > m.maxCursor() {
+			m.cursor = m.maxCursor()
+		}
+		return m, nil
+
 	case spinner.TickMsg:
 		var cmd tea.Cmd
 		m.spinner, cmd = m.spinner.Update(msg)
 		return m, cmd
 	}
 	return m, nil
+}
+
+// toolRowVisible 指示列表下方「OpenSteamTool」那一行是否显示。
+func (m *appModel) toolRowVisible() bool {
+	return m.toolUpdateAvail || !m.toolAutoCheck || m.upgrading
+}
+
+// maxCursor 是可选中的最大光标位置：结果项 + 商店搜索行（+ OpenSteamTool 行）。
+func (m *appModel) maxCursor() int {
+	n := len(m.results)
+	if m.toolRowVisible() {
+		n++
+	}
+	return n
 }
 
 // updateLuaMode 处理「已安装 Lua」模式的按键。
@@ -343,7 +410,7 @@ func (m *appModel) updateLuaMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 // updateLuaContentView 处理「查看 Lua 内容」模式的按键。
 func (m *appModel) updateLuaContentView(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	h := m.listHeight()
+	h := m.luaListHeight()
 	switch msg.String() {
 	case "esc", "q", "enter":
 		m.mode = modeLua
@@ -407,11 +474,12 @@ func (m *appModel) View() string {
 		list,
 		"",
 		action,
+		m.renderToolAction(),
 		"",
 		status,
 		help,
 	)
-	box := boxStyle.Width(boxW).Render(content)
+	box := boxStyle.Width(boxW).Render(fitContent(content, boxW))
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
@@ -436,12 +504,12 @@ func (m *appModel) viewLua(boxW int) string {
 		status,
 		help,
 	)
-	box := boxStyle.Width(boxW).Render(content)
+	box := boxStyle.Width(boxW).Render(fitContent(content, boxW))
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
 func (m *appModel) renderLuaList() string {
-	h := m.listHeight()
+	h := m.luaListHeight()
 	lines := make([]string, h)
 
 	if len(m.luas) == 0 {
@@ -492,7 +560,7 @@ func (m *appModel) viewLuaContent(boxW int) string {
 	content := m.renderLuaContent() // 内部会 clamp contentScroll
 
 	total := len(m.luaContent)
-	h := m.listHeight()
+	h := m.luaListHeight()
 	start := m.contentScroll + 1
 	end := m.contentScroll + h
 	if end > total {
@@ -507,14 +575,24 @@ func (m *appModel) viewLuaContent(boxW int) string {
 	status := m.statusLine()
 	help := helpStyle.Render("↑/↓ 滚动 · Esc/q 返回 · Ctrl-C 退出")
 
-	box := boxStyle.Width(boxW).Render(lipgloss.JoinVertical(lipgloss.Left,
+	box := boxStyle.Width(boxW).Render(fitContent(lipgloss.JoinVertical(lipgloss.Left,
 		title, "", header, "", content, "", hint, "", status, help,
-	))
+	), boxW))
 	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, box)
 }
 
+// fitContent 先把内容按盒子内宽截断，避免 boxStyle.Width 触发自动换行、
+// 导致盒子高度随文本长度变化。
+func fitContent(content string, boxW int) string {
+	innerW := boxW - 6 // 边框 2 + 左右 padding 各 2
+	if innerW < 1 {
+		innerW = 1
+	}
+	return lipgloss.NewStyle().MaxWidth(innerW).Render(content)
+}
+
 func (m *appModel) renderLuaContent() string {
-	h := m.listHeight()
+	h := m.luaListHeight()
 	total := len(m.luaContent)
 	if m.contentScroll > total-h {
 		m.contentScroll = total - h
@@ -538,11 +616,16 @@ func (m *appModel) listHeight() int {
 	if h == 0 {
 		h = 24
 	}
-	h -= 13
+	h -= 14
 	if h < 4 {
 		h = 4
 	}
 	return h
+}
+
+// luaListHeight 是 lua 视图的列表高度（比搜索视图多 1 行，保证整体盒子同高）。
+func (m *appModel) luaListHeight() int {
+	return m.listHeight() + 1
 }
 
 func (m *appModel) renderList() string {
@@ -608,9 +691,31 @@ func (m *appModel) renderAction() string {
 	return actionStyle.Render("  " + action)
 }
 
+// renderToolAction 渲染 OpenSteamTool 那一行（固定在列表下方）。
+func (m *appModel) renderToolAction() string {
+	switch {
+	case m.upgrading:
+		return noticeStyle.Render("  OpenSteamTool 更新中...")
+	case m.toolUpdateAvail:
+		label := "⚠ OpenSteamTool 有新版本"
+		if m.cursor == len(m.results)+1 {
+			return actionSelStyle.Render("▶ " + label)
+		}
+		return noticeStyle.Render("  " + label)
+	case !m.toolAutoCheck:
+		// 关闭了自动检查：保留手动入口
+		label := "检查 OpenSteamTool 更新"
+		if m.cursor == len(m.results)+1 {
+			return actionSelStyle.Render("▶ " + label)
+		}
+		return actionStyle.Render("  " + label)
+	}
+	return ""
+}
+
 func (m *appModel) statusLine() string {
 	switch {
-	case m.downloading:
+	case m.downloading || m.upgrading:
 		return fmt.Sprintf("%s %s", m.spinner.View(), m.status)
 	case m.status != "":
 		if m.statusOK {
@@ -651,6 +756,26 @@ func doDownloadID(appid string) tea.Cmd {
 	return func() tea.Msg {
 		res, err := download(appid, "")
 		return downloadDoneMsg{label: "id=" + appid, res: res, err: err}
+	}
+}
+
+// doUpdateTool 在 TUI 中检查并（如有）安装 OpenSteamTool 最新版。
+// 静默执行，不打印以免破坏界面。
+func doUpdateTool() tea.Cmd {
+	return func() tea.Msg {
+		if isSteamRunning() {
+			return upgradeDoneMsg{err: fmt.Errorf("Steam 正在运行，请先退出 Steam 再更新")}
+		}
+		installed := installedToolVersion(steamDir)
+		latest, err := latestTag(15 * time.Second)
+		if err != nil {
+			return upgradeDoneMsg{err: err}
+		}
+		if installed == latest {
+			return upgradeDoneMsg{version: latest, uptodate: true}
+		}
+		ver, err := doInstallTool(steamDir)
+		return upgradeDoneMsg{version: ver, err: err}
 	}
 }
 
