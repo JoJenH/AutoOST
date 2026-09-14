@@ -1,0 +1,45 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+          mkdir -p dist
+          GOOS=windows GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/lua4ost.exe .
+          GOOS=darwin  GOARCH=arm64 go build -trimpath -ldflags "$LDFLAGS" -o dist/lua4ost-macos-arm64 .
+          GOOS=darwin  GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/lua4ost-macos-amd64 .
+          GOOS=linux   GOARCH=amd64 go build -trimpath -ldflags "$LDFLAGS" -o dist/lua4ost-linux-amd64 .
+          (cd dist && zip -q lua4ost-windows-amd64.zip lua4ost.exe)
+          ls -lh dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/lua4ost.exe
+            dist/lua4ost-windows-amd64.zip
+            dist/lua4ost-macos-arm64
+            dist/lua4ost-macos-amd64
+            dist/lua4ost-linux-amd64
+          generate_release_notes: true

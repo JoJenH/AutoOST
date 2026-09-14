@@ -28,6 +28,26 @@ go build -o lua4ost .
 GOOS=windows GOARCH=amd64 go build -o lua4ost.exe .
 ```
 
+## 发布 Release
+
+推一个 `v*` tag 即可，`.github/workflows/release.yml` 会在 GitHub 的 runner 上自动构建各平台并创建 Release：
+
+```bash
+git tag -a v0.1.0 -m "v0.1.0"
+git push origin v0.1.0
+```
+
+产物：`lua4ost.exe` 与 `lua4ost-windows-amd64.zip`、`lua4ost-macos-arm64`、`lua4ost-macos-amd64`、`lua4ost-linux-amd64`；Release 说明由 GitHub 自动生成。
+
+版本号在构建时注入：
+
+```bash
+go build -trimpath -ldflags "-s -w -X main.version=v0.1.0" -o lua4ost .
+./lua4ost --version     # lua4ost v0.1.0
+```
+
+不加 `-X main.version` 时（例如本地 `go build`）版本显示为 `dev`。`-s -w` 可去掉调试信息，Windows 版体积从 ~11.2MB 降到 ~7.8MB。
+
 ## 用法
 
 ```bash
@@ -35,6 +55,7 @@ GOOS=windows GOARCH=amd64 go build -o lua4ost.exe .
 ./lua4ost update              # 刷新游戏列表，并把 OpenSteamTool 升级到最新版
 ./lua4ost                     # 进入 TUI，搜索并下载
 ./lua4ost "Counter-Strike 2"  # 进入 TUI，预填游戏名并自动搜索
+./lua4ost --version           # 查看版本
 ```
 
 ## 首次启动流程

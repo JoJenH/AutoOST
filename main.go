@@ -46,6 +46,9 @@ var steamDir string
 // downloadManifests 表示是否把 depot manifest 一并下到 depotcache（由配置决定）。
 var downloadManifests = true
 
+// version 由构建时注入：-ldflags "-X main.version=v1.0.0"。
+var version = "dev"
+
 // stdin 全局共享一个带缓冲的读取器。多次新建 bufio.Scanner(os.Stdin) 会各自
 // 预读缓冲，导致管道输入时后续提示读不到数据。
 var stdin = bufio.NewReader(os.Stdin)
@@ -63,8 +66,17 @@ func readLine() (string, bool) {
 // ---------------------------------------------------------------- 入口
 
 func main() {
+	// 版本查询不需要任何配置，放在最前面。
+	if len(os.Args) == 2 {
+		switch os.Args[1] {
+		case "--version", "-v", "version":
+			fmt.Println("lua4ost", version)
+			return
+		}
+	}
+
 	if len(os.Args) > 2 {
-		fmt.Fprintf(os.Stderr, "用法: %s [appid|游戏名|update]\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "用法: %s [appid|游戏名|update|--version]\n", os.Args[0])
 		os.Exit(1)
 	}
 
