@@ -70,7 +70,7 @@ func main() {
 	if len(os.Args) == 2 {
 		switch os.Args[1] {
 		case "--version", "-v", "version":
-			fmt.Println("lua4ost", version)
+			printVersion()
 			return
 		}
 	}
@@ -149,6 +149,55 @@ func main() {
 }
 
 // ---------------------------------------------------------------- 配置
+
+// printVersion 输出版本号与 OpenSteamTool 状态；不写任何配置、不交互。
+func printVersion() {
+	fmt.Println("lua4ost", version)
+
+	cfg, err := loadConfig()
+	if err != nil {
+		fmt.Println("Steam 目录: 配置读取失败:", err)
+		return
+	}
+	if cfg.SteamDir == "" {
+		fmt.Println("Steam 目录: 未配置（首次运行时会提示设置）")
+		return
+	}
+	dirLine := cfg.SteamDir
+	if !isDir(cfg.SteamDir) {
+		dirLine += "（目录不存在）"
+	}
+	fmt.Println("Steam 目录:", dirLine)
+
+	installed := installedToolVersion(cfg.SteamDir)
+	_, statErr := os.Stat(filepath.Join(cfg.SteamDir, ostFlagName))
+	switch {
+	case statErr != nil:
+		fmt.Println("OpenSteamTool: 未安装")
+	case installed == "":
+		fmt.Println("OpenSteamTool: 已安装（flag 未记录版本）")
+	default:
+		fmt.Println("OpenSteamTool: v" + installed)
+	}
+
+	if !cfg.autoCheckUpdate() {
+		fmt.Println("  最新版本: 未查询（已关闭自动检查更新）")
+		return
+	}
+	latest, err := latestTag(5 * time.Second)
+	if err != nil {
+		fmt.Println("  最新版本: 查询失败")
+		return
+	}
+	switch {
+	case installed == "":
+		fmt.Printf("  最新版本: v%s\n", latest)
+	case installed == latest:
+		fmt.Printf("  最新版本: v%s（已是最新）\n", latest)
+	default:
+		fmt.Printf("  最新版本: v%s（有更新：v%s → v%s）\n", latest, installed, latest)
+	}
+}
 
 type config struct {
 	SteamDir         string `json:"steam_dir"`

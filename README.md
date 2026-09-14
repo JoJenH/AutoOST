@@ -43,10 +43,21 @@ git push origin v0.1.0
 
 ```bash
 go build -trimpath -ldflags "-s -w -X main.version=v0.1.0" -o lua4ost .
-./lua4ost --version     # lua4ost v0.1.0
 ```
 
 不加 `-X main.version` 时（例如本地 `go build`）版本显示为 `dev`。`-s -w` 可去掉调试信息，Windows 版体积从 ~11.2MB 降到 ~7.8MB。
+
+`--version` 会连同 OpenSteamTool 状态一起输出（只读，不交互、不写配置）：
+
+```
+$ ./lua4ost --version
+lua4ost v0.1.0
+Steam 目录: /path/to/Steam
+OpenSteamTool: v1.4.8
+  最新版本: v1.4.9（有更新：v1.4.8 → v1.4.9）
+```
+
+最新版本一行遵循 `auto_check_update`：关闭时显示「未查询（已关闭自动检查更新）」；未配置 Steam 目录时只输出第一行。
 
 ## 用法
 
@@ -55,7 +66,7 @@ go build -trimpath -ldflags "-s -w -X main.version=v0.1.0" -o lua4ost .
 ./lua4ost update              # 刷新游戏列表，并把 OpenSteamTool 升级到最新版
 ./lua4ost                     # 进入 TUI，搜索并下载
 ./lua4ost "Counter-Strike 2"  # 进入 TUI，预填游戏名并自动搜索
-./lua4ost --version           # 查看版本
+./lua4ost --version           # 查看版本与 OpenSteamTool 状态
 ```
 
 ## 首次启动流程
