@@ -392,10 +392,15 @@ func (m *appModel) updateLuaMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.confirmDelete = ""
-		if err := deleteLuaFile(name); err != nil {
+		n, err := deleteLuaFile(name)
+		switch {
+		case err != nil:
 			m.status = fmt.Sprintf("删除失败: %v", err)
 			m.statusOK = false
-		} else {
+		case n > 0:
+			m.status = fmt.Sprintf("已删除 %s（同时清理 %d 个 manifest）", name, n)
+			m.statusOK = true
+		default:
 			m.status = fmt.Sprintf("已删除 %s", name)
 			m.statusOK = true
 		}

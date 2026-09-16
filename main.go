@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
 	"os"
@@ -28,8 +29,6 @@ const (
 	githubRaw   = "https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/%s/%s.lua"
 	manifestRaw = "https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/%s/%s"
 	appListURL  = "https://raw.githubusercontent.com/Austrum-lab/steam-appdb/master/data/all.json"
-	appListFile = "applist.json"
-	configFile  = "config.json"
 	storeSearch = "https://store.steampowered.com/api/storesearch/"
 	userAgent   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -63,9 +62,75 @@ func readLine() (string, bool) {
 	return line, true
 }
 
+// ---------------------------------------------------------------- 路径与日志
+
+// 配置目录固定为 <用户家目录>/.config/lua4ost/，三个文件路径在 setupPaths 里算出。
+var (
+	configDir   string
+	configFile  string
+	appListFile string
+	logFile     string
+)
+
+// setupPaths 计算配置目录（~/.config/lua4ost）并创建；家目录取不到时退化为当前目录。
+func setupPaths() {
+	home, err := os.UserHomeDir()
+	if err != nil || home == "" {
+		home = "."
+	}
+	dir := filepath.Join(home, ".config", "lua4ost")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		dir = "."
+	}
+	configDir = dir
+	configFile = filepath.Join(dir, "config.json")
+	appListFile = filepath.Join(dir, "applist.json")
+	logFile = filepath.Join(dir, "lua4ost.log")
+}
+
+// migrateLegacy 把旧版本放在工作目录下的 config.json / applist.json 搬到配置目录。
+func migrateLegacy() {
+	if _, err := os.Stat(configFile); err != nil {
+		if data, err := os.ReadFile("config.json"); err == nil {
+			if err := os.WriteFile(configFile, data, 0o644); err == nil {
+				fmt.Fprintf(os.Stderr, "已把 config.json 迁移到 %s\n", configFile)
+			}
+		}
+	}
+	if _, err := os.Stat(appListFile); err != nil {
+		if _, err := os.Stat("applist.json"); err == nil {
+			_ = os.Rename("applist.json", appListFile) // 同盘瞬间完成；跨盘失败就重新拉
+		}
+	}
+}
+
+// logger 写 <配置目录>/lua4ost.log；打不开时退化为不记录，绝不影响主流程。
+var logger *log.Logger
+
+func setupLogging() {
+	const maxLogSize = 2 << 20 // 2MB 后轮转一份 .1，避免无限增长
+	if fi, err := os.Stat(logFile); err == nil && fi.Size() > maxLogSize {
+		_ = os.Rename(logFile, logFile+".1")
+	}
+	f, err := os.OpenFile(logFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	logger = log.New(f, "", log.LstdFlags|log.Lmicroseconds)
+}
+
+// logf 写一行日志；未初始化时静默丢弃。
+func logf(format string, args ...any) {
+	if logger != nil {
+		logger.Printf(format, args...)
+	}
+}
+
 // ---------------------------------------------------------------- 入口
 
 func main() {
+	setupPaths()
+
 	// 版本查询不需要任何配置，放在最前面。
 	if len(os.Args) == 2 {
 		switch os.Args[1] {
@@ -74,6 +139,12 @@ func main() {
 			return
 		}
 	}
+
+	setupLogging()
+	migrateLegacy()
+	logf("===== 启动 lua4ost %s (%s/%s) 配置目录=%s args=%v =====",
+		version, runtime.GOOS, runtime.GOARCH, configDir, os.Args[1:])
+	defer logf("===== 退出 =====")
 
 	if len(os.Args) > 2 {
 		fmt.Fprintf(os.Stderr, "用法: %s [appid|游戏名|update|--version]\n", os.Args[0])
@@ -161,6 +232,8 @@ func printVersion() {
 	}
 	if cfg.SteamDir == "" {
 		fmt.Println("Steam 目录: 未配置（首次运行时会提示设置）")
+		fmt.Println("配置目录:", configDir)
+		fmt.Println("日志文件:", logFile)
 		return
 	}
 	dirLine := cfg.SteamDir
@@ -168,6 +241,8 @@ func printVersion() {
 		dirLine += "（目录不存在）"
 	}
 	fmt.Println("Steam 目录:", dirLine)
+	fmt.Println("配置目录:", configDir)
+	fmt.Println("日志文件:", logFile)
 
 	installed := installedToolVersion(cfg.SteamDir)
 	_, statErr := os.Stat(filepath.Join(cfg.SteamDir, ostFlagName))
@@ -280,6 +355,7 @@ func ensureSteamDir() (string, error) {
 		cfg.AutoCheckUpdate = &auto
 		dm := promptYesNo("是否下载 depot manifest 到 depotcache? [Y/n]: ", true)
 		cfg.DownloadManifest = &dm
+		logf("首次配置: steam_dir=%s auto_check_update=%v download_manifest=%v", abs, auto, dm)
 		if err := saveConfig(cfg); err != nil {
 			return "", err
 		}
@@ -303,8 +379,12 @@ func promptYesNo(prompt string, def bool) bool {
 	return def
 }
 
-// expandPath 展开 ~ 和环境变量（如 $HOME）。
+// expandPath 展开 ~ 和环境变量。
+// Windows 自身不认 ~（那是 Unix shell 的约定），这里由我们主动展开：
+// os.UserHomeDir() 在 Windows 上取 %USERPROFILE%，因此 ~ / ~\ 同样可用。
+// 另外额外支持 Windows 风格的 %VAR%（os.ExpandEnv 只认 $VAR/${VAR}）。
 func expandPath(p string) string {
+	p = strings.TrimSpace(p)
 	if p == "~" {
 		if home, err := os.UserHomeDir(); err == nil {
 			return home
@@ -316,7 +396,22 @@ func expandPath(p string) string {
 			return filepath.Join(home, p[2:])
 		}
 	}
-	return os.ExpandEnv(p)
+	p = os.ExpandEnv(p)
+	if runtime.GOOS == "windows" {
+		p = expandPercentEnv(p)
+	}
+	return p
+}
+
+var rePercentEnv = regexp.MustCompile(`%([A-Za-z_][A-Za-z0-9_]*)%`)
+
+func expandPercentEnv(s string) string {
+	return rePercentEnv.ReplaceAllStringFunc(s, func(m string) string {
+		if v, ok := os.LookupEnv(m[1 : len(m)-1]); ok {
+			return v
+		}
+		return m
+	})
 }
 
 func isDir(p string) bool {
@@ -350,20 +445,26 @@ func installedToolVersion(dir string) string {
 // 返回是否有可用更新（任何时候都不自动重装）。
 func ensureTool(dir string, autoCheck bool) (bool, error) {
 	installed := installedToolVersion(dir)
+	logf("OpenSteamTool: 目录=%s 已装版本=%q autoCheck=%v", dir, installed, autoCheck)
 	if installed == "" {
 		if err := installToolCLI(dir); err != nil {
+			logf("OpenSteamTool 安装失败: %v", err)
 			return false, err
 		}
 		return false, nil
 	}
 	if !autoCheck {
+		logf("OpenSteamTool: 已关闭自动检查，跳过版本查询")
 		return false, nil
 	}
 	latest, err := latestTag(5 * time.Second)
 	if err != nil {
-		return false, nil // 检查失败，当作无更新
+		logf("OpenSteamTool: 查询最新版本失败（按无更新处理）: %v", err)
+		return false, nil
 	}
-	return installed != latest, nil
+	has := installed != latest
+	logf("OpenSteamTool: 已装=%s 最新=%s 有更新=%v", installed, latest, has)
+	return has, nil
 }
 
 // installToolCLI 交互式安装/升级 OpenSteamTool（检测 Steam 运行并等待退出）。
@@ -459,6 +560,7 @@ func checkWritable(zipPath, dest string) error {
 		}
 		fh, err := os.OpenFile(target, os.O_WRONLY, 0)
 		if err != nil {
+			logf("可写性预检失败: %s 被占用: %v", target, err)
 			return fmt.Errorf("无法覆盖 %s（文件被占用，请先退出 Steam 及相关游戏）: %w", name, err)
 		}
 		fh.Close()
@@ -524,6 +626,7 @@ func latestTag(timeout time.Duration) (string, error) {
 	if tag == "" || tag == "." || tag == "/" {
 		return "", fmt.Errorf("无法从跳转地址解析 tag: %s", loc)
 	}
+	logf("OpenSteamTool latest tag = %s", tag)
 	return tag, nil
 }
 
@@ -583,6 +686,7 @@ func pickZipAsset(assets []ghAsset) (ghAsset, error) {
 }
 
 func downloadFile(url, dst string) error {
+	start := time.Now()
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return err
@@ -591,10 +695,12 @@ func downloadFile(url, dst string) error {
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		logf("GET %s 失败: %v", url, err)
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		logf("GET %s -> HTTP %d", url, resp.StatusCode)
 		return fmt.Errorf("下载失败 (HTTP %d)", resp.StatusCode)
 	}
 
@@ -603,8 +709,13 @@ func downloadFile(url, dst string) error {
 		return err
 	}
 	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	n, err := io.Copy(f, resp.Body)
+	if err != nil {
+		logf("GET %s 写入 %s 失败: %v", url, dst, err)
+		return err
+	}
+	logf("GET %s -> HTTP 200, %d 字节 -> %s (%v)", url, n, dst, time.Since(start).Round(time.Millisecond))
+	return nil
 }
 
 func extractZip(zipPath, dest string) error {
@@ -667,11 +778,19 @@ func loadAppList() ([]appEntry, error) {
 			return nil, err
 		}
 		fmt.Fprintf(os.Stderr, "未找到 %s，正在从 GitHub 拉取...\n", appListFile)
+		logf("本地 app 列表不存在，开始拉取")
 		if err := fetchAppList(); err != nil {
+			logf("app 列表拉取失败: %v", err)
 			return nil, err
 		}
 	}
-	return readAppList(appListFile)
+	apps, err := readAppList(appListFile)
+	if err != nil {
+		logf("app 列表解析失败 (%s): %v", appListFile, err)
+		return nil, err
+	}
+	logf("已载入 app 列表 %s: %d 条", appListFile, len(apps))
+	return apps, nil
 }
 
 // updateAppList 强制重新拉取（手动 update 命令用）。
@@ -681,6 +800,7 @@ func updateAppList() error {
 }
 
 func fetchAppList() error {
+	start := time.Now()
 	req, err := http.NewRequest("GET", appListURL, nil)
 	if err != nil {
 		return err
@@ -701,13 +821,15 @@ func fetchAppList() error {
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	n, err := io.Copy(f, resp.Body)
+	if err != nil {
 		f.Close()
 		return err
 	}
 	if err := f.Close(); err != nil {
 		return err
 	}
+	logf("GET %s -> HTTP 200, %d 字节 -> %s (%v)", appListURL, n, appListFile, time.Since(start).Round(time.Millisecond))
 	return os.Rename(tmp, appListFile)
 }
 
@@ -742,6 +864,7 @@ func searchLocal(query string, apps []appEntry) []appEntry {
 	if q == "" {
 		return nil
 	}
+	start := time.Now()
 
 	type scored struct {
 		e appEntry
@@ -779,11 +902,16 @@ func searchLocal(query string, apps []appEntry) []appEntry {
 			break
 		}
 	}
+	// 本地搜索每次按键都会跑，只在无结果（会触发商店回退）时记录，避免刷屏
+	if len(out) == 0 {
+		logf("搜索[本地] %q -> 0 条 (库 %d 条, 耗时 %v)", q, len(apps), time.Since(start).Round(time.Millisecond))
+	}
 	return out
 }
 
 // searchRemote 是本地搜索 0 结果时的回退：调 Steam 商店搜索（短超时）。
 func searchRemote(name string) ([]appEntry, error) {
+	start := time.Now()
 	langs := [][2]string{{"english", "US"}, {"schinese", "CN"}}
 	if isCJK(name) {
 		langs[0], langs[1] = langs[1], langs[0]
@@ -792,10 +920,13 @@ func searchRemote(name string) ([]appEntry, error) {
 	for _, l := range langs {
 		items, err := searchStore(name, l[0], l[1])
 		if err != nil {
+			logf("搜索[商店] %q l=%s cc=%s 失败: %v", name, l[0], l[1], err)
 			lastErr = err
 			continue
 		}
+		logf("搜索[商店] %q l=%s cc=%s -> %d 条", name, l[0], l[1], len(items))
 		if len(items) > 0 {
+			logf("搜索[商店] %q 命中 (总耗时 %v)", name, time.Since(start).Round(time.Millisecond))
 			return items, nil
 		}
 	}
@@ -825,6 +956,7 @@ func searchStore(name, lang, cc string) ([]appEntry, error) {
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("搜索失败 (HTTP %d)", resp.StatusCode)
 	}
+	logf("GET %s?term=%s&l=%s&cc=%s -> HTTP %d", storeSearch, url.QueryEscape(name), lang, cc, resp.StatusCode)
 
 	var sr struct {
 		Items []struct {
@@ -889,6 +1021,9 @@ func (r downloadResult) String() string {
 
 // download 优先从 GitHub ManifestHub 下载，拿不到再回退 Walftech。
 func download(appid, name string) (downloadResult, error) {
+	start := time.Now()
+	logf("下载开始 appid=%s name=%q (manifest=%v)", appid, name, downloadManifests)
+
 	if out, size, ok := downloadGitHub(appid, name); ok {
 		res := downloadResult{Source: "GitHub", File: out, Size: size}
 		// lua 里用 setManifestid 固定了 depot 版本，顺带把这些 manifest 拉进 depotcache。
@@ -899,25 +1034,34 @@ func download(appid, name string) (downloadResult, error) {
 				}
 			}
 		}
+		logf("下载完成 appid=%s 来源=GitHub 文件=%s 大小=%d manifest=%d 跳过=%d 总耗时=%v",
+			appid, out, size, res.Manifests, res.Skipped, time.Since(start).Round(time.Millisecond))
 		return res, nil
 	}
 
+	logf("ManifestHub 无该分支，回退 Walftech (appid=%s)", appid)
 	challenge, difficulty, err := getChallenge()
 	if err != nil {
+		logf("下载失败 appid=%s 阶段=challenge: %v", appid, err)
 		return downloadResult{}, err
 	}
 	t0 := time.Now()
 	nonce := solvePow(challenge, difficulty)
 	powMs := time.Since(t0).Milliseconds()
+	logf("PoW appid=%s difficulty=%d nonce=%d 耗时=%dms", appid, difficulty, nonce, powMs)
 
 	token, err := redeem(appid, challenge, nonce)
 	if err != nil {
+		logf("下载失败 appid=%s 阶段=redeem: %v", appid, err)
 		return downloadResult{}, err
 	}
 	out, size, manifests, err := downloadLuaFull(appid, token, name)
 	if err != nil {
+		logf("下载失败 appid=%s 阶段=walftech下载: %v", appid, err)
 		return downloadResult{}, err
 	}
+	logf("下载完成 appid=%s 来源=Walftech 文件=%s lua大小=%d manifest=%d 总耗时=%v",
+		appid, out, size, manifests, time.Since(start).Round(time.Millisecond))
 	return downloadResult{
 		Source:     "Walftech",
 		File:       out,
@@ -933,28 +1077,35 @@ func downloadGitHub(appid, name string) (string, int64, bool) {
 	u := fmt.Sprintf(githubRaw, appid, appid)
 	req, err := http.NewRequest("GET", u, nil)
 	if err != nil {
+		logf("GET %s 构造请求失败: %v", u, err)
 		return "", 0, false
 	}
 	req.Header.Set("User-Agent", userAgent)
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		logf("GET %s 失败: %v", u, err)
 		return "", 0, false
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		logf("GET %s -> HTTP %d（该 appid 无 ManifestHub 分支）", u, resp.StatusCode)
 		return "", 0, false
 	}
 
 	basename := luaFilename(appid, name)
 	dir, err := luaOutputDir()
 	if err != nil {
+		logf("创建 lua 目录失败: %v", err)
 		return "", 0, false
 	}
-	size, err := saveFile(filepath.Join(dir, basename), resp.Body)
+	dest := filepath.Join(dir, basename)
+	size, err := saveFile(dest, resp.Body)
 	if err != nil {
+		logf("写入 %s 失败: %v", dest, err)
 		return "", 0, false
 	}
+	logf("GET %s -> HTTP 200, 已保存 %s (%d 字节)", u, dest, size)
 	return basename, size, true
 }
 
@@ -1005,26 +1156,39 @@ func parseManifests(lua []byte) []manifestRef {
 func syncManifests(appid string, lua []byte) (ok, skipped int) {
 	refs := parseManifests(lua)
 	if len(refs) == 0 {
+		logf("manifest 同步 appid=%s: lua 里没有 setManifestid", appid)
 		return 0, 0
 	}
 	dir := filepath.Join(steamDir, "depotcache")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
+		logf("manifest 同步 appid=%s: 创建 %s 失败: %v", appid, dir, err)
 		return 0, len(refs)
 	}
+	logf("manifest 同步 appid=%s: lua 声明了 %d 个 depot", appid, len(refs))
 	for _, r := range refs {
 		name := r.Depot + "_" + r.GID + ".manifest"
 		dest := filepath.Join(dir, name)
 		if _, err := os.Stat(dest); err == nil {
 			ok++ // 已存在，跳过下载
+			logf("  manifest %s 已存在，跳过", name)
 			continue
 		}
-		if err := downloadFile(fmt.Sprintf(manifestRaw, appid, name), dest); err != nil {
+		u := fmt.Sprintf(manifestRaw, appid, name)
+		if err := downloadFile(u, dest); err != nil {
 			os.Remove(dest)
 			skipped++
+			logf("  manifest %s 下载失败（共享 depot 通常是 404）: %v", name, err)
 			continue
 		}
+		fi, _ := os.Stat(dest)
+		var sz int64
+		if fi != nil {
+			sz = fi.Size()
+		}
 		ok++
+		logf("  manifest %s 已保存 (%d 字节)", name, sz)
 	}
+	logf("manifest 同步 appid=%s: 成功 %d, 跳过 %d", appid, ok, skipped)
 	return ok, skipped
 }
 
@@ -1048,16 +1212,58 @@ func listLuaFiles() ([]string, error) {
 	return files, nil
 }
 
-// deleteLuaFile 删除 Steam/config/lua 下的指定 .lua 文件。
-func deleteLuaFile(name string) error {
+// deleteLuaFile 删除 lua，并清理因此变成孤儿的 depot manifest：
+// 仍被其它 lua 引用的 manifest 会保留（例如 228990_1829726630299308803 就常被多个游戏共用）。
+// 返回一并删除的 manifest 个数。
+func deleteLuaFile(name string) (int, error) {
 	if name == "" || filepath.Base(name) != name {
-		return fmt.Errorf("非法文件名: %s", name)
+		return 0, fmt.Errorf("非法文件名: %s", name)
 	}
 	dir, err := luaOutputDir()
 	if err != nil {
-		return err
+		return 0, err
 	}
-	return os.Remove(filepath.Join(dir, name))
+	luaPath := filepath.Join(dir, name)
+
+	// 删之前先记下它引用了哪些 manifest
+	var mine []manifestRef
+	if data, err := os.ReadFile(luaPath); err == nil {
+		mine = parseManifests(data)
+	}
+
+	if err := os.Remove(luaPath); err != nil {
+		return 0, err
+	}
+
+	// 剩余 lua 仍在引用的 manifest 集合
+	still := make(map[string]bool)
+	if files, err := listLuaFiles(); err == nil {
+		for _, f := range files {
+			data, err := os.ReadFile(filepath.Join(dir, f))
+			if err != nil {
+				continue
+			}
+			for _, r := range parseManifests(data) {
+				still[r.Depot+"_"+r.GID] = true
+			}
+		}
+	}
+
+	depotDir := filepath.Join(steamDir, "depotcache")
+	removed := 0
+	for _, r := range mine {
+		key := r.Depot + "_" + r.GID
+		if still[key] {
+			logf("删除 lua %s: manifest %s 仍被其它 lua 引用，保留", name, key)
+			continue
+		}
+		if err := os.Remove(filepath.Join(depotDir, key+".manifest")); err == nil {
+			removed++
+			logf("删除 lua %s: 一并删除 manifest %s.manifest", name, key)
+		}
+	}
+	logf("删除 lua %s 完成（清理 manifest %d 个）", name, removed)
+	return removed, nil
 }
 
 // readLuaFile 读取 Steam/config/lua 下的 .lua 文件内容，按行返回。
@@ -1190,14 +1396,16 @@ func redeem(appid, challenge string, nonce int64) (string, error) {
 // lua 写入 <Steam>/config/lua/，manifest 写入 <Steam>/depotcache/。
 // 返回 lua 文件名、lua 大小、写入的 manifest 个数。
 func downloadLuaFull(appid, token, name string) (string, int64, int, error) {
+	start := time.Now()
 	q := url.Values{}
 	q.Set("id", appid)
 	q.Set("token", token)
+	format := "lua"
 	if downloadManifests {
-		q.Set("format", "full") // zip：lua + 全部 manifest
-	} else {
-		q.Set("format", "lua") // 只要 lua，体积小得多
+		format = "full" // zip：lua + 全部 manifest
 	}
+	q.Set("format", format)
+	logf("GET %s?%s", baseURL+"/depotbox_lua.php", "id="+appid+"&format="+format+"&token=***")
 
 	req, err := walftechRequest("GET", "/depotbox_lua.php", nil, q)
 	if err != nil {
@@ -1205,11 +1413,13 @@ func downloadLuaFull(appid, token, name string) (string, int64, int, error) {
 	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
+		logf("GET depotbox_lua.php(appid=%s) 失败: %v", appid, err)
 		return "", 0, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 200))
+		logf("GET depotbox_lua.php(appid=%s) -> HTTP %d: %s", appid, resp.StatusCode, string(data))
 		return "", 0, 0, fmt.Errorf("下载失败 (HTTP %d): %s", resp.StatusCode, string(data))
 	}
 
@@ -1217,6 +1427,7 @@ func downloadLuaFull(appid, token, name string) (string, int64, int, error) {
 	if err != nil {
 		return "", 0, 0, err
 	}
+	logf("GET depotbox_lua.php(appid=%s) -> HTTP 200, format=%s, %d 字节", appid, format, len(body))
 
 	luaDir, err := luaOutputDir()
 	if err != nil {
@@ -1230,6 +1441,7 @@ func downloadLuaFull(appid, token, name string) (string, int64, int, error) {
 		if err := os.WriteFile(luaPath, body, 0o644); err != nil {
 			return "", 0, 0, err
 		}
+		logf("walftech 返回纯 lua，已保存 %s (%d 字节, %v)", luaPath, len(body), time.Since(start).Round(time.Millisecond))
 		return luaName, int64(len(body)), 0, nil
 	}
 
@@ -1269,6 +1481,8 @@ func downloadLuaFull(appid, token, name string) (string, int64, int, error) {
 	if luaSize == 0 {
 		return "", 0, 0, fmt.Errorf("zip 里没有 .lua 文件")
 	}
+	logf("walftech zip 解包完成 appid=%s: lua=%s (%d 字节), manifest=%d (%v)",
+		appid, luaName, luaSize, manifests, time.Since(start).Round(time.Millisecond))
 	return luaName, luaSize, manifests, nil
 }
 

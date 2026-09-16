@@ -72,6 +72,8 @@ OpenSteamTool: v1.4.8
 ## 首次启动流程
 
 1. 提示输入 **Steam 运行目录**（支持 `~` 和环境变量），校验必须为已存在的文件夹。
+
+   > Windows 本身不认 `~`（那是 Unix shell 的约定），但这里是**由本工具主动展开**的：`os.UserHomeDir()` 在 Windows 上取 `%USERPROFILE%`，所以 `~`、`~\` 同样可用；另外也支持 `$HOME` 与 Windows 风格的 `%USERPROFILE%`。
 2. 依次询问两个开关（都直接回车即为开启，与目录一起写入 `config.json`）：
    - **是否自动检查 OpenSteamTool 更新**（`[Y/n]`）；
    - **是否下载 depot manifest 到 depotcache**（`[Y/n]`）。
@@ -114,7 +116,7 @@ OpenSteamTool: v1.4.8
 |------|------|
 | `↑` / `↓` | 选择文件 |
 | `回车` | 查看文件内容 |
-| `d` / `Delete` | 删除（二次确认：再按一次才真正删除） |
+| `d` / `Delete` | 删除（二次确认：再按一次才真正删除；同时清理因此不再被引用的 manifest） |
 | `Esc` | 返回搜索模式 |
 
 ### 内容查看
@@ -165,15 +167,44 @@ https://github.com/steamtoolsapp/ManifestHub/raw/refs/heads/<appid>/<depot>_<gid
 - `*.manifest` → `<Steam>/depotcache/`（文件名本身已是 `<depot>_<gid>.manifest`）
 - 已存在的 manifest 不重复写；zip 里的说明 txt 等其它文件会忽略。
 
+> 删除 lua 时会顺带清理 `<Steam>/depotcache/` 里因此变成孤儿的 manifest；**仍被其它 lua 引用的会保留**（例如 `228990_1829726630299308803` 常被多个游戏共用）。
+
 ## 生成的文件
 
-| 文件 | 说明 |
+配置目录固定在 **`<用户家目录>/.config/lua4ost/`**（Windows 上是 `C:\Users\<你>\.config\lua4ost\`）：
+
+| 路径 | 说明 |
 |------|------|
-| `config.json` | 保存 `steam_dir`、`auto_check_update`、`download_manifest`（已 gitignore） |
-| `applist.json` | 本地游戏列表缓存（已 gitignore） |
-| `<Steam>/.AutoOST.flag` | OpenSteamTool 已安装标记 |
+| `~/.config/lua4ost/config.json` | 保存 `steam_dir`、`auto_check_update`、`download_manifest` |
+| `~/.config/lua4ost/applist.json` | 本地游戏列表缓存（约 25MB） |
+| `~/.config/lua4ost/lua4ost.log` | 运行日志，排错用 |
+| `<Steam>/.AutoOST.flag` | OpenSteamTool 已安装标记（内容为版本号） |
 | `<Steam>/config/lua/*.lua` | 下载的 Lua 文件 |
 | `<Steam>/depotcache/<depot>_<gid>.manifest` | 下载的 depot manifest |
+
+> 从旧版本升级时，工作目录下的 `config.json` / `applist.json` 会在首次启动时自动迁移到配置目录。
+
+## 日志
+
+`~/.config/lua4ost/lua4ost.log` 记录搜索与下载的完整过程，排错时先看它：
+
+```
+===== 启动 lua4ost v1.0.0 (windows/amd64) 配置目录=... args=[2087460] =====
+OpenSteamTool: 目录=... 已装版本="1.4.8" autoCheck=true
+OpenSteamTool: 已装=1.4.8 最新=1.4.8 有更新=false
+下载开始 appid=2087460 name="" (manifest=true)
+GET .../ManifestHub/raw/refs/heads/2087460/2087460.lua 失败: ... EOF
+ManifestHub 无该分支，回退 Walftech (appid=2087460)
+PoW appid=2087460 difficulty=4 nonce=29936 耗时=23ms
+GET depotbox_lua.php(appid=2087460) -> HTTP 200, format=full, 68763 字节
+walftech zip 解包完成: lua=2087460.lua (924 字节), manifest=2
+下载完成 appid=2087460 来源=Walftech lua大小=924 manifest=2 总耗时=5.858s
+```
+
+- 记录内容：启动参数、配置读取、app 列表拉取/解析、本地与商店搜索（含每次请求的 URL 与 HTTP 状态）、GitHub/Walftech 两条下载路径、PoW 详情、每个 manifest 的结果、删除操作、OpenSteamTool 安装/更新与可写性预检。
+- 每次按键的本地搜索只在**0 结果**时记录，避免刷屏。
+- 日志超过 2MB 自动轮转成 `lua4ost.log.1`。
+- 具体位置可用 `./lua4ost --version` 查看。
 
 ## 依赖
 
